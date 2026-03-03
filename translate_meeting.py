@@ -273,7 +273,7 @@ def _summary_prompt(transcript):
     """依據逐字稿內容選擇摘要 prompt（有 Speaker 標籤用對話版）"""
     if "[Speaker " in transcript:
         return SUMMARY_PROMPT_DIARIZE_TEMPLATE.format(transcript=transcript)
-    return _summary_prompt(transcript)
+    return SUMMARY_PROMPT_TEMPLATE.format(transcript=transcript)
 
 
 # 場景名稱對照（CLI 用）
@@ -2140,8 +2140,9 @@ class _SummaryStatusBar:
         # 設定 scroll region，保留最後一行給狀態列
         try:
             cols, rows = os.get_terminal_size()
-            sys.stdout.write(f"\x1b[1;{rows - 1}r")
-            sys.stdout.write(f"\x1b[{rows - 1};1H")
+            sys.stdout.write(f"\x1b7")                    # 儲存游標位置
+            sys.stdout.write(f"\x1b[1;{rows - 1}r")       # scroll region
+            sys.stdout.write(f"\x1b8")                     # 還原游標位置（不強制跳行）
             sys.stdout.flush()
             self._active = True
         except Exception:
@@ -2194,8 +2195,9 @@ class _SummaryStatusBar:
                 try:
                     cols, rows = os.get_terminal_size()
                     with self._lock:
+                        sys.stdout.write(f"\x1b7")
                         sys.stdout.write(f"\x1b[1;{rows - 1}r")
-                        sys.stdout.write(f"\x1b[{rows - 1};1H")
+                        sys.stdout.write(f"\x1b8")
                         sys.stdout.flush()
                 except Exception:
                     pass
