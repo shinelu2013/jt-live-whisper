@@ -46,8 +46,6 @@ Author: Jason Cheng (Jason Tools)
 
 ![離線處理選單：模式與模型選擇](images/offline-menu-1.png)
 
-![離線處理選單：LLM 伺服器與講者辨識](images/offline-menu-2.png)
-
 ### 3. AI 講者辨識（Speaker Diarization）
 自動辨識音訊中的不同講者，以不同顏色標示，支援自動偵測或手動指定講者人數。
 
@@ -160,6 +158,8 @@ ollama pull qwen2.5:14b
 程式會進入互動式選單，依序選擇功能模式、翻譯引擎、AI 辨識模型等設定。音訊裝置全自動偵測，不需手動選擇。
 
 ![互動式選單](images/interactive-menu.png)
+
+![互動式選單：遠端 GPU 與錄音設定](images/interactive-menu-2.png)
 
 ## 使用方式
 
