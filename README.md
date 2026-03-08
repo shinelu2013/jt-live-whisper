@@ -1,4 +1,4 @@
-# jt-live-whisper v2.1.1
+# jt-live-whisper v2.1.2
 
 **100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、講者辨識、會議摘要，所有 AI 模型皆在自有設備上運行，資料不經過任何雲端服務。
 
@@ -261,7 +261,7 @@ ollama pull qwen2.5:14b
 | `--llm-model MODEL` | LLM 翻譯模型 | qwen2.5:14b |
 | `--llm-host HOST` | LLM 伺服器位址 | 無（需設定） |
 | `--topic TOPIC` | 會議主題（提升翻譯品質） | |
-| `--summary-model MODEL` | 摘要用 LLM 模型 | qwen2.5:14b |
+| `--summary-model MODEL` | 摘要用 LLM 模型 | gpt-oss:120b |
 | `--input FILE` | 離線處理音訊檔 | |
 | `--diarize` | 啟用 AI 講者辨識 | |
 | `--num-speakers N` | 指定講者人數 | 自動偵測 |

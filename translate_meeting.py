@@ -237,7 +237,7 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 # 常見 LLM 伺服器預設 port（供參考）
 LLM_PRESETS = [
@@ -6848,7 +6848,7 @@ def parse_args():
         help=f"功能模式 ({' / '.join(mode_names)}，預設 en2zh 英翻中)")
     parser.add_argument(
         "--asr", choices=["whisper", "moonshine"], metavar="ASR",
-        help="語音辨識引擎 (whisper / moonshine，英文模式預設 moonshine)")
+        help="語音辨識引擎 (whisper / moonshine，預設 whisper)")
     parser.add_argument(
         "-m", "--model", choices=model_names, metavar="MODEL",
         help=f"Whisper 模型 ({' / '.join(model_names)}，--input 預設 large-v3-turbo，中文品質最好用 -m large-v3)")
