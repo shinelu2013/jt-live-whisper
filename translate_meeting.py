@@ -37,7 +37,24 @@ import sentencepiece
 
 # 簡體→台灣繁體轉換器（僅字元層級轉換，不做詞組匹配避免誤轉如「裡面包含」→「裡麵包含」）
 # 詞組層級的轉換（如 面包→麵包）交由 LLM 在翻譯時直接輸出正確繁體
-S2TWP = opencc.OpenCC("s2tw")
+_S2TW_RAW = opencc.OpenCC("s2tw")
+
+import re
+# s2tw 字元層級會把簡體「只」一律轉成「隻」，但副詞用法應為「只」
+# 正則修正：「隻」前面不是量詞語境（數字/幾/兩/這/那/每/各）時，還原為「只」
+_RE_ZHI_FIX = re.compile(r"(?<![零一二三四五六七八九十百千萬幾兩這那每各\d])隻(?![眼耳手腳腿])")
+
+
+def _s2tw(text):
+    """簡體→台灣繁體，含已知誤轉後處理"""
+    result = _S2TW_RAW.convert(text)
+    # 正則修正：非量詞語境的「隻」→「只」
+    result = _RE_ZHI_FIX.sub("只", result)
+    return result
+
+
+# 相容舊名
+S2TWP = type("_S2TWProxy", (), {"convert": staticmethod(_s2tw)})()
 
 # Moonshine ASR（選用，未安裝時自動降級為 Whisper only）
 _MOONSHINE_AVAILABLE = False
@@ -127,8 +144,8 @@ ARGOS_PKG_PATH = os.path.expanduser(
     "~/.local/share/argos-translate/packages/translate-en_zh-1_9"
 )
 
-# LLM 伺服器設定（預設值，可被 config.json 覆蓋）
-OLLAMA_DEFAULT_HOST = "192.168.1.40"
+# LLM 伺服器設定（預設無，由 config.json 或 --llm-host 指定）
+OLLAMA_DEFAULT_HOST = None
 OLLAMA_DEFAULT_PORT = 11434
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
@@ -151,12 +168,18 @@ def save_config(cfg):
 
 
 _config = load_config()
-OLLAMA_HOST = _config.get("ollama_host", OLLAMA_DEFAULT_HOST)
-OLLAMA_PORT = _config.get("ollama_port", OLLAMA_DEFAULT_PORT)
+# 向後相容：先讀新欄位 llm_host，再讀舊欄位 ollama_host
+OLLAMA_HOST = _config.get("llm_host", _config.get("ollama_host", OLLAMA_DEFAULT_HOST))
+OLLAMA_PORT = _config.get("llm_port", _config.get("ollama_port", OLLAMA_DEFAULT_PORT))
 
 # 遠端 GPU Whisper 辨識
 REMOTE_WHISPER_DEFAULT_PORT = 8978
 REMOTE_WHISPER_CONFIG = _config.get("remote_whisper", None)
+
+# 錄音輸出格式（預設 mp3，支援 mp3/ogg/flac/wav）
+RECORDING_FORMAT = _config.get("recording_format", "mp3")
+if RECORDING_FORMAT not in ("mp3", "ogg", "flac", "wav"):
+    RECORDING_FORMAT = "mp3"
 
 # 內建翻譯模型（作者篩選推薦）
 _BUILTIN_TRANSLATE_MODELS = [
@@ -214,7 +237,7 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "1.9.4"
+APP_VERSION = "2.0.9"
 
 # 常見 LLM 伺服器預設 port（供參考）
 LLM_PRESETS = [
@@ -271,7 +294,7 @@ SUMMARY_PROMPT_TEMPLATE = """\
 - 全部使用台灣繁體中文
 - 使用台灣用語（軟體、網路、記憶體、程式、伺服器等）
 - 專有名詞維持英文原文
-- 不要加入原文沒有的內容
+- **嚴禁**加入原文沒有的內容，不要自行編造開場白、結語、總結語句或任何原文未出現的話語
 - 不要逐行標註時間戳記或逐行對照英中文，直接輸出流暢的中文段落
 
 以下是逐字稿：
@@ -300,19 +323,21 @@ Speaker 1：整理後的這段話內容。
 
 Speaker 2：整理後的這段話內容。
 
+Speaker 2：同一位講者的下一段話，仍然必須標注 Speaker 2。
+
 Speaker 1：整理後的這段話內容。
 
 ...
 
 規則：
-- 逐字稿中 [Speaker N] 標記的是不同的講者，校正後必須保留講者標記，格式為「Speaker N：內容」
+- **最重要**：每一個段落開頭都必須標注講者（Speaker N：），絕對不可省略，即使連續多段都是同一位講者
 - 同一位講者的連續短句要合併成完整的段落，不要逐句列出
 - 不同講者之間換行分隔
 - 逐字稿中 [EN] 標記的是英文原文語音辨識結果，[中] 標記的是中文翻譯。校正時請以中文翻譯為主，參考英文原文修正翻譯錯誤
 - 全部使用台灣繁體中文
 - 使用台灣用語（軟體、網路、記憶體、程式、伺服器等）
 - 專有名詞維持英文原文
-- 不要加入原文沒有的內容
+- **嚴禁**加入原文沒有的內容，不要自行編造開場白、結語、總結語句或任何原文未出現的話語
 - 不要保留時間戳記
 
 以下是逐字稿：
@@ -345,12 +370,32 @@ SUMMARY_MERGE_PROMPT_TEMPLATE = """\
 ---
 """
 
-def _summary_prompt(transcript, topic=None):
-    """依據逐字稿內容選擇摘要 prompt（有 Speaker 標籤用對話版）"""
+def _summary_prompt(transcript, topic=None, summary_mode="both"):
+    """依據逐字稿內容選擇摘要 prompt（有 Speaker 標籤用對話版）
+    summary_mode: "both"（摘要+逐字稿）、"summary"（只摘要）、"transcript"（只逐字稿）
+    """
     if "[Speaker " in transcript:
         prompt = SUMMARY_PROMPT_DIARIZE_TEMPLATE.format(transcript=transcript)
     else:
         prompt = SUMMARY_PROMPT_TEMPLATE.format(transcript=transcript)
+
+    if summary_mode == "summary":
+        # 移除校正逐字稿相關段落
+        prompt = prompt.replace("完成兩件事：", "完成以下任務：")
+        prompt = prompt.replace("1. **重點摘要**：", "**重點摘要**：")
+        # 移除逐字稿任務描述行
+        prompt = re.sub(r'2\. \*\*校正逐字稿\*\*：[^\n]*\n', '', prompt)
+        # 移除輸出格式中的校正逐字稿區段
+        prompt = re.sub(r'\n## 校正逐字稿\n.*?(?=\n規則：)', '\n', prompt, flags=re.DOTALL)
+    elif summary_mode == "transcript":
+        # 移除重點摘要相關段落
+        prompt = prompt.replace("完成兩件事：", "完成以下任務：")
+        prompt = prompt.replace("2. **校正逐字稿**：", "**校正逐字稿**：")
+        # 移除摘要任務描述行
+        prompt = re.sub(r'1\. \*\*重點摘要\*\*：[^\n]*\n', '', prompt)
+        # 移除輸出格式中的重點摘要區段
+        prompt = re.sub(r'\n## 重點摘要\n.*?(?=\n## 校正逐字稿)', '', prompt, flags=re.DOTALL)
+
     if topic:
         prompt = prompt.replace(
             "以下是逐字稿：",
@@ -362,7 +407,7 @@ def _summary_prompt(transcript, topic=None):
 # 場景名稱對照（CLI 用）
 SCENE_MAP = {"meeting": 0, "training": 1, "subtitle": 2}
 MODE_MAP = {key: i for i, (key, _, _) in enumerate(MODE_PRESETS)}
-APP_NAME = f"jt-live-whisper v{APP_VERSION} - 即時英翻中字幕系統"
+APP_NAME = f"jt-live-whisper v{APP_VERSION} - 100% 全地端 AI 語音工具集"
 APP_AUTHOR = "by Jason Cheng (Jason Tools)"
 
 
@@ -1303,17 +1348,17 @@ def _remote_whisper_start(rw_cfg, force_restart=False):
                 if data.get("status") == "ok":
                     return  # 伺服器已在運行，直接沿用
         except Exception:
-            pass  # 伺服器未運行，繼續啟動流程
-    else:
-        # 強制重啟：先停掉舊的 server
-        kill_cmd = _ssh_cmd_parts(rw_cfg) + [f"pkill -f 'server.py --port {port}' 2>/dev/null; sleep 0.5"]
-        try:
-            subprocess.run(kill_cmd, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+            pass  # 伺服器未運行或無回應，先清理再啟動
+    # 先停掉舊的 server（避免 port 佔用或 event loop 阻塞導致無法回應）
+    kill_cmd = _ssh_cmd_parts(rw_cfg) + [f"pkill -f 'server.py --port {port}' 2>/dev/null; sleep 0.5"]
+    try:
+        subprocess.run(kill_cmd, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
     cmd = _ssh_cmd_parts(rw_cfg) + [
-        f"cd ~/jt-whisper-server && nohup venv/bin/python3 server.py --port {port} "
-        f"> /tmp/jt-whisper-server.log 2>&1 &"
+        "cd ~/jt-whisper-server && export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH && "
+        f"nohup venv/bin/python3 server.py --port {port} "
+        "> /tmp/jt-whisper-server.log 2>&1 &"
     ]
     try:
         # 不用 capture_output，讓 SSH 密碼提示可互動
@@ -1348,7 +1393,8 @@ def _remote_whisper_models(rw_cfg, timeout=5):
 
 
 def _remote_whisper_health(rw_cfg, timeout=30):
-    """輪詢 /health 等待遠端 server 就緒，回傳 (ok, has_gpu)"""
+    """輪詢 /health 等待遠端 server 就緒，回傳 (ok, has_gpu)
+    額外將 backend 資訊存入 rw_cfg['_backend']（供 metadata 使用）"""
     host = rw_cfg["host"]
     port = rw_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
     url = f"http://{host}:{port}/health"
@@ -1359,11 +1405,97 @@ def _remote_whisper_health(rw_cfg, timeout=30):
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
                 if data.get("status") == "ok":
+                    rw_cfg["_backend"] = data.get("backend", "")
                     return True, data.get("gpu", False)
         except Exception:
             pass
         time.sleep(1)
     return False, False
+
+
+def _remote_whisper_status(rw_cfg):
+    """查詢遠端 /v1/status，回傳 dict 或 None（連線失敗）"""
+    host = rw_cfg["host"]
+    port = rw_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
+    url = f"http://{host}:{port}/v1/status"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _check_remote_before_upload(rw_cfg, file_size_bytes=0):
+    """上傳前檢查遠端狀態：忙碌 / 磁碟空間。
+    回傳 True 可繼續，False 使用者取消（降級本機）。"""
+    status = _remote_whisper_status(rw_cfg)
+    if status is None:
+        return True  # 舊版 server 沒有 /v1/status，略過檢查
+
+    # 磁碟空間檢查（至少需要檔案大小的 3 倍 + 500MB 餘裕）
+    need_gb = max((file_size_bytes * 3) / (1024 ** 3), 0.5)
+    disk_free = status.get("disk_free_gb", 999)
+    if disk_free < need_gb:
+        print(f"\n  {C_HIGHLIGHT}[警告] 遠端磁碟空間不足：{disk_free} GB 可用（需要約 {need_gb:.1f} GB）{RESET}")
+        print(f"  {C_DIM}請清理遠端 /tmp 或磁碟空間後再試{RESET}")
+        return False
+
+    # 忙碌狀態檢查
+    if status.get("busy"):
+        task = status.get("task", {})
+        task_type = task.get("type", "unknown")
+        elapsed = task.get("elapsed", 0)
+        client_ip = task.get("client_ip", "")
+        model = task.get("model", "")
+        mins = int(elapsed) // 60
+        secs = int(elapsed) % 60
+
+        task_desc = "辨識" if task_type == "transcribe" else "講者辨識"
+        source = f"（來自 {client_ip}）" if client_ip else ""
+
+        print(f"\n  {C_HIGHLIGHT}[忙碌] 遠端伺服器正在執行{task_desc}{source}{RESET}")
+        print(f"  {C_DIM}模型: {model}，已執行 {mins}:{secs:02d}{RESET}")
+        print()
+        print(f"  {C_DIM}[1]{RESET} {C_WHITE}等候（每 5 秒重試）{RESET}")
+        print(f"  {C_DIM}[2]{RESET} {C_WHITE}強制中斷遠端作業（可能是殘留的已斷線作業）{RESET}")
+        print(f"  {C_DIM}[3]{RESET} {C_WHITE}改用本機 CPU 辨識{RESET}")
+        print(f"{C_WHITE}選擇 (1-3) [1]：{RESET}", end=" ")
+
+        try:
+            choice = input().strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if choice == "2":
+            # 強制重啟遠端 server
+            print(f"  {C_DIM}正在重啟遠端伺服器...{RESET}", end="", flush=True)
+            _remote_whisper_start(rw_cfg, force_restart=True)
+            ok, _ = _remote_whisper_health(rw_cfg, timeout=30)
+            if ok:
+                print(f" {C_OK}✓ 已重啟{RESET}")
+                return True
+            else:
+                print(f" {C_HIGHLIGHT}重啟失敗{RESET}")
+                return False
+        elif choice == "3":
+            print(f"  {C_OK}→ 改用本機 CPU 辨識{RESET}")
+            return False
+        else:
+            # 等候
+            print(f"  {C_DIM}等候遠端伺服器...{RESET}", flush=True)
+            while True:
+                time.sleep(5)
+                st = _remote_whisper_status(rw_cfg)
+                if st is None or not st.get("busy"):
+                    print(f"  {C_OK}→ 遠端伺服器已就緒{RESET}")
+                    return True
+                t = st.get("task", {})
+                e = t.get("elapsed", 0)
+                print(f"  {C_DIM}仍在忙碌（已 {int(e)//60}:{int(e)%60:02d}）...{RESET}", flush=True)
+
+    return True
 
 
 class _ProgressBody(io.BytesIO):
@@ -1399,7 +1531,7 @@ class _ProgressBody(io.BytesIO):
 
 def _remote_whisper_transcribe(rw_cfg, wav_path, model, language,
                                progress_callback=None, on_upload_done=None):
-    """POST 音訊到遠端 /v1/audio/transcriptions，回傳 (segments, duration, proc_time, device)"""
+    """POST 音訊到遠端 /v1/audio/transcriptions（串流 NDJSON），回傳 (segments, duration, proc_time, device)"""
     host = rw_cfg["host"]
     port = rw_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
     url = f"http://{host}:{port}/v1/audio/transcriptions"
@@ -1434,6 +1566,13 @@ def _remote_whisper_transcribe(rw_cfg, wav_path, model, language,
         f"{language}\r\n"
     )
 
+    # stream field（啟用串流回傳）
+    body_parts.append(
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"stream\"\r\n\r\n"
+        f"true\r\n"
+    )
+
     body_parts.append(f"--{boundary}--\r\n")
 
     # 組合 body（混合 str 和 bytes）
@@ -1453,10 +1592,60 @@ def _remote_whisper_transcribe(rw_cfg, wav_path, model, language,
 
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
-            # 上傳完成，伺服器開始辨識
-            if progress_callback:
-                progress_callback("辨識中，等待伺服器回應...")
-            data = json.loads(resp.read().decode())
+            content_type = resp.headers.get("Content-Type", "")
+
+            if "ndjson" in content_type:
+                # 串流模式：逐行讀取 NDJSON
+                if on_upload_done:
+                    on_upload_done()
+                segments = []
+                duration = 0
+                proc_time = 0
+                device = "unknown"
+                for raw_line in resp:
+                    line = raw_line.decode().strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event["type"] == "segment":
+                        segments.append({"start": event["start"], "end": event["end"], "text": event["text"]})
+                        duration = event.get("duration", 0)
+                        if progress_callback and duration > 0:
+                            pct = min(event["end"] / duration, 1.0)
+                            pos = int(event["end"])
+                            dur = int(duration)
+                            progress_callback(f"{pct:.0%}  {pos//60}:{pos%60:02d} / {dur//60}:{dur%60:02d}")
+                    elif event["type"] == "done":
+                        duration = event.get("duration", duration)
+                        proc_time = event.get("processing_time", 0)
+                        device = event.get("device", "unknown")
+                    elif event["type"] == "heartbeat":
+                        elapsed = event.get("elapsed", 0)
+                        mins = int(elapsed) // 60
+                        secs = int(elapsed) % 60
+                        if progress_callback:
+                            pct = event.get("progress")
+                            if pct is not None:
+                                hb_cur = event.get("current", 0)
+                                hb_dur = event.get("duration", 0)
+                                pos = int(hb_cur)
+                                dur = int(hb_dur)
+                                progress_callback(
+                                    f"{pct:.0%}  {pos//60}:{pos%60:02d}/{dur//60}:{dur%60:02d}"
+                                    f"  已耗時 {mins}:{secs:02d}")
+                            else:
+                                progress_callback(f"伺服器辨識中（{mins}:{secs:02d}）")
+                    elif event["type"] == "error":
+                        raise RuntimeError(f"遠端辨識錯誤: {event.get('detail', '未知錯誤')}")
+            else:
+                # 非串流模式（向下相容舊版伺服器）
+                if progress_callback:
+                    progress_callback("辨識中，等待伺服器回應...")
+                data = json.loads(resp.read().decode())
+                segments = data.get("segments", [])
+                duration = data.get("duration", 0)
+                proc_time = data.get("processing_time", 0)
+                device = data.get("device", "unknown")
     except urllib.error.HTTPError as e:
         # 讀取伺服器回傳的錯誤訊息
         err_body = ""
@@ -1473,10 +1662,6 @@ def _remote_whisper_transcribe(rw_cfg, wav_path, model, language,
                 detail = err_body[:200]
         raise RuntimeError(f"遠端伺服器錯誤 ({e.code}): {detail or e.reason}") from e
 
-    segments = data.get("segments", [])
-    duration = data.get("duration", 0)
-    proc_time = data.get("processing_time", 0)
-    device = data.get("device", "unknown")
     return segments, duration, proc_time, device
 
 
@@ -1659,21 +1844,25 @@ def _check_llm_server(host, port):
         return server_type, all_models
 
 
-def select_translator():
+def select_translator(init_host=None, init_port=None):
     """讓用戶選擇翻譯引擎和模型，回傳 (engine, model, host, port, server_type)"""
-    host = OLLAMA_HOST
-    port = OLLAMA_PORT
+    host = init_host or OLLAMA_HOST
+    port = init_port or OLLAMA_PORT
 
     print(f"\n\n{C_TITLE}{BOLD}▎ 翻譯引擎{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
 
-    # 先自動偵測預設 LLM 伺服器
-    print(f"  {C_DIM}正在偵測 LLM 伺服器 ({host}:{port})...{RESET}", end=" ", flush=True)
-    server_type, available_models = _check_llm_server(host, port)
+    server_type, available_models = None, []
+    if host:
+        # 有設定 LLM 伺服器，自動偵測
+        print(f"  {C_DIM}正在偵測 LLM 伺服器 ({host}:{port})...{RESET}", end=" ", flush=True)
+        server_type, available_models = _check_llm_server(host, port)
 
     if not server_type:
-        # 預設位址連不上，問使用者要不要輸入其他位址
-        print(f"{C_HIGHLIGHT}未偵測到{RESET}")
+        if host:
+            # 有設定但連不上
+            print(f"{C_HIGHLIGHT}未偵測到{RESET}")
+        # 問使用者要不要輸入位址
         print(f"  {C_WHITE}輸入 LLM 伺服器位址，或按 Enter 使用離線翻譯：{RESET}", end=" ")
         try:
             ip_input = input().strip()
@@ -1704,9 +1893,11 @@ def select_translator():
     print(f"{C_OK}{BOLD}{srv_label}（{len(available_models)} 個模型）{RESET}")
 
     # 記住成功連線的位址
-    if host != _config.get("ollama_host") or port != _config.get("ollama_port"):
-        _config["ollama_host"] = host
-        _config["ollama_port"] = port
+    if host != OLLAMA_HOST or port != OLLAMA_PORT:
+        _config["llm_host"] = host
+        _config["llm_port"] = port
+        _config.pop("ollama_host", None)
+        _config.pop("ollama_port", None)
         save_config(_config)
 
     # 建立選項列表
@@ -1765,6 +1956,68 @@ def select_translator():
         return engine, None, None, None, None
 
 
+def _select_llm_model(host, port, server_type):
+    """CLI 模式下讓使用者選擇 LLM 翻譯模型（-e llm 但沒指定 --llm-model）"""
+    available_models = _llm_list_models(host, port, server_type)
+    if server_type == "ollama":
+        remote_set = set(available_models)
+        available_models = [name for name, _ in OLLAMA_MODELS if name in remote_set]
+
+    if not available_models:
+        print(f"  {C_HIGHLIGHT}[警告] LLM 伺服器無可用模型，使用預設 qwen2.5:14b{RESET}")
+        return "qwen2.5:14b"
+
+    def _dw(s):
+        return sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in s)
+
+    options = []
+    if server_type == "ollama":
+        for model_name in available_models:
+            desc = next((d for n, d in OLLAMA_MODELS if n == model_name), "")
+            options.append((f"Ollama {model_name}", desc, model_name))
+    else:
+        for model_name in available_models:
+            options.append((model_name, "", model_name))
+
+    col = max(_dw(label) for label, *_ in options) + 2
+
+    default_idx = 0
+    for i, (_, _, mod) in enumerate(options):
+        if mod == "qwen2.5:14b":
+            default_idx = i
+            break
+
+    print(f"\n\n{C_TITLE}{BOLD}▎ LLM 翻譯模型{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    for i, (label, desc, _) in enumerate(options):
+        padded = label + ' ' * (col - _dw(label))
+        if i == default_idx:
+            print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {padded}{RESET} {C_WHITE}{desc}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        else:
+            print(f"  {C_DIM}[{i}]{RESET} {C_WHITE}{padded}{RESET} {C_DIM}{desc}{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    print(f"{C_WHITE}按 Enter 使用預設，或輸入編號：{RESET}", end=" ")
+
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    idx = default_idx
+    if user_input:
+        try:
+            idx = int(user_input)
+            if not (0 <= idx < len(options)):
+                idx = default_idx
+        except ValueError:
+            idx = default_idx
+
+    label, desc, model = options[idx]
+    print(f"  {C_OK}→ {label}{RESET}\n")
+    return model
+
+
 def _input_interactive_menu(args):
     """--input 互動選單：選擇模式、講者辨識、摘要"""
 
@@ -1796,8 +2049,13 @@ def _input_interactive_menu(args):
         # 如果 CLI 帶了 --diarize，預設辨識選項改為「自動偵測」
         cli_diarize = args.diarize
 
-        # 離線處理過濾掉「純錄音」模式
-        input_modes = [(k, n, d) for k, n, d in MODE_PRESETS if k != "record"]
+        # 離線處理過濾掉「純錄音」模式，並改用離線用語
+        _input_labels = {"en2zh": ("英文轉錄+中文翻譯", "英文語音 → 轉錄並翻譯成繁體中文"),
+                         "zh2en": ("中文轉錄+英文翻譯", "中文語音 → 轉錄並翻譯成英文")}
+        input_modes = [
+            (k, _input_labels[k][0], _input_labels[k][1]) if k in _input_labels else (k, n, d)
+            for k, n, d in MODE_PRESETS if k != "record"
+        ]
 
         print(f"\n\n{C_TITLE}{BOLD}▎ 功能模式{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
@@ -1937,12 +2195,17 @@ def _input_interactive_menu(args):
 
         if need_translate:
             # LLM 伺服器
-            default_addr = f"{ollama_host}:{ollama_port}"
             print(f"\n\n{C_TITLE}{BOLD}▎ LLM 伺服器{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
-            print(f"  {C_WHITE}目前設定: {default_addr}{RESET}")
-            print(f"{C_DIM}{'─' * 60}{RESET}")
-            print(f"{C_WHITE}按 Enter 使用目前設定，或輸入新位址（host:port）：{RESET}", end=" ")
+            if ollama_host:
+                default_addr = f"{ollama_host}:{ollama_port}"
+                print(f"  {C_WHITE}目前設定: {default_addr}{RESET}")
+                print(f"{C_DIM}{'─' * 60}{RESET}")
+                print(f"{C_WHITE}按 Enter 使用目前設定，或輸入新位址（host:port）：{RESET}", end=" ")
+            else:
+                print(f"  {C_DIM}尚未設定 LLM 伺服器{RESET}")
+                print(f"{C_DIM}{'─' * 60}{RESET}")
+                print(f"{C_WHITE}輸入 LLM 伺服器位址（host:port），或按 Enter 使用離線翻譯：{RESET}", end=" ")
 
             addr_input = input().strip()
             if addr_input:
@@ -1958,14 +2221,17 @@ def _input_interactive_menu(args):
             ollama_asked = True
 
             # 偵測伺服器類型
-            print(f"  {C_DIM}正在偵測 LLM 伺服器...{RESET}", end=" ", flush=True)
-            llm_server_type, llm_models = _check_llm_server(ollama_host, ollama_port)
-            if llm_server_type:
-                srv_label = "Ollama" if llm_server_type == "ollama" else "OpenAI 相容"
-                print(f"{C_OK}✓ {srv_label} @ {ollama_host}:{ollama_port}（{len(llm_models)} 個模型）{RESET}")
+            if ollama_host:
+                print(f"  {C_DIM}正在偵測 LLM 伺服器...{RESET}", end=" ", flush=True)
+                llm_server_type, llm_models = _check_llm_server(ollama_host, ollama_port)
+                if llm_server_type:
+                    srv_label = "Ollama" if llm_server_type == "ollama" else "OpenAI 相容"
+                    print(f"{C_OK}✓ {srv_label} @ {ollama_host}:{ollama_port}（{len(llm_models)} 個模型）{RESET}")
+                else:
+                    print(f"{C_HIGHLIGHT}未偵測到 LLM 伺服器（{ollama_host}:{ollama_port}）{RESET}")
+                    print(f"  {C_HIGHLIGHT}⚠ 翻譯功能需要 LLM 伺服器，請確認伺服器已啟動{RESET}")
             else:
-                print(f"{C_HIGHLIGHT}未偵測到 LLM 伺服器（{ollama_host}:{ollama_port}）{RESET}")
-                print(f"  {C_HIGHLIGHT}⚠ 翻譯功能需要 LLM 伺服器，請確認伺服器已啟動{RESET}")
+                llm_models = []
 
             # 翻譯模型
             if llm_server_type == "ollama":
@@ -2006,7 +2272,7 @@ def _input_interactive_menu(args):
             ollama_model = translate_models[o_idx][0]
 
         # ── 第四步：講者辨識 ──
-        default_diarize = 1 if cli_diarize else 0
+        default_diarize = 1
         diarize_options = [
             ("不辨識", ""),
             ("自動偵測講者數", ""),
@@ -2022,6 +2288,7 @@ def _input_interactive_menu(args):
                 print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {padded}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
             else:
                 print(f"  {C_DIM}[{i}]{RESET} {C_WHITE}{padded}{RESET}")
+        print(f"  {C_HIGHLIGHT}* 若講者超過 2 位，建議選 [2] 指定人數以提升辨識正確率{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"{C_WHITE}按 Enter 使用預設，或輸入編號：{RESET}", end=" ")
 
@@ -2055,8 +2322,9 @@ def _input_interactive_menu(args):
         # ── 第五步：摘要 ──
         default_summarize = 0
         summarize_options = [
-            ("不摘要", ""),
-            ("產生摘要與校正逐字稿", ""),
+            ("產出摘要與校正逐字稿", "both"),
+            ("只產出摘要", "summary"),
+            ("只產出逐字稿", "transcript"),
         ]
 
         print(f"\n\n{C_TITLE}{BOLD}▎ 摘要與逐字稿校正{RESET}")
@@ -2081,7 +2349,8 @@ def _input_interactive_menu(args):
                 s_idx = default_summarize
         else:
             s_idx = default_summarize
-        do_summarize = s_idx == 1
+        summary_mode = summarize_options[s_idx][1]
+        do_summarize = True
 
         # 選了摘要 → 先確認 LLM 伺服器（若翻譯步驟未問過）→ 選摘要模型
         summary_model = SUMMARY_DEFAULT_MODEL
@@ -2152,8 +2421,10 @@ def _input_interactive_menu(args):
 
         # 記住 LLM 伺服器位址（如果有改）
         if ollama_host != OLLAMA_HOST or ollama_port != OLLAMA_PORT:
-            _config["ollama_host"] = ollama_host
-            _config["ollama_port"] = ollama_port
+            _config["llm_host"] = ollama_host
+            _config["llm_port"] = ollama_port
+            _config.pop("ollama_host", None)
+            _config.pop("ollama_port", None)
             save_config(_config)
 
         # ── 主題（選填，提升翻譯與摘要品質）──
@@ -2206,7 +2477,7 @@ def _input_interactive_menu(args):
 
         return (mode_key, fw_model, ollama_model, summary_model,
                 ollama_host, ollama_port, diarize, num_speakers, do_summarize,
-                llm_server_type, use_remote_whisper, meeting_topic)
+                llm_server_type, use_remote_whisper, meeting_topic, summary_mode)
 
     except (EOFError, KeyboardInterrupt):
         print()
@@ -2215,7 +2486,8 @@ def _input_interactive_menu(args):
 
 def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                length_ms: int = 5000, step_ms: int = 3000, mode: str = "en2zh",
-               record: bool = False, rec_device: int = None):
+               record: bool = False, rec_device: int = None,
+               meeting_topic: str = None):
     """啟動 whisper-stream 子程序並即時翻譯輸出"""
 
     whisper_lang = "en" if mode in ("en2zh", "en") else "zh"
@@ -2233,9 +2505,10 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
 
     # 翻譯記錄檔（以時間命名）
     from datetime import datetime
-    log_prefixes = {"en2zh": "en2zh_translation", "zh2en": "zh2en_translation", "en": "en_transcribe", "zh": "zh_transcribe"}
-    log_prefix = log_prefixes.get(mode, "translation")
-    log_filename = datetime.now().strftime(f"{log_prefix}_%Y%m%d_%H%M%S.txt")
+    log_prefixes = {"en2zh": "英翻中_逐字稿", "zh2en": "中翻英_逐字稿", "en": "英文_逐字稿", "zh": "中文_逐字稿"}
+    log_prefix = log_prefixes.get(mode, "逐字稿")
+    topic_part = _topic_to_filename_part(meeting_topic)
+    log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
 
@@ -2260,7 +2533,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         dev_info = sd.query_devices(rec_dev_id)
         rec_sr = int(dev_info["default_samplerate"])
         rec_ch = max(dev_info["max_input_channels"], 1)
-        recorder = _AudioRecorder(rec_sr, rec_ch)
+        recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic)
 
         def rec_callback(indata, frames, time_info, status):
             recorder.write_raw(indata)
@@ -2386,25 +2659,34 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         "en": "說英文即可看到字幕",
         "zh": "說中文即可看到字幕",
     }
-    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n", flush=True)
+    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
 
     # 設定底部固定狀態列（快捷鍵提示 + 即時資訊）
-    setup_status_bar(mode)
+    setup_status_bar(mode, model_name=model_name, asr_location="本機")
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
     # 被動音量監控（Whisper 無錄音時，開輕量 stream 讀 BlackHole 給狀態列波形）
     if not record:
         audio_monitor = _start_audio_monitor()
 
-    # 非同步翻譯：英文立刻顯示，中文在背景翻完再補上
+    # 非同步翻譯：英文立刻顯示，中文在背景翻完再補上（有序輸出）
     print_lock = threading.Lock()
+    _trans_seq = [0]       # 遞增序號
+    _trans_pending = {}    # seq → (src_text, result, elapsed)
+    _trans_next = [0]      # 下一個該顯示的序號
+    _trans_lock = threading.Lock()
 
-    def translate_and_print(src_text, log_path):
-        """背景執行緒：翻譯並印出結果"""
-        t0 = time.monotonic()
-        result = translator.translate(src_text)
-        elapsed = time.monotonic() - t0
-        if result:
+    def _drain_translations(log_path):
+        """按序號依序輸出所有已就緒的翻譯結果"""
+        while True:
+            with _trans_lock:
+                entry = _trans_pending.pop(_trans_next[0], None)
+                if entry is None:
+                    break
+                _trans_next[0] += 1
+            src_text, result, elapsed = entry
+            if not result:
+                continue
             if elapsed < 1.0:
                 speed_badge = C_BADGE_FAST
             elif elapsed < 3.0:
@@ -2412,12 +2694,14 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             else:
                 speed_badge = C_BADGE_SLOW
             if mode == "zh2en":
+                src_color, src_label = C_ZH, "中"
                 dst_color, dst_label = C_EN, "EN"
-                src_label = "中"
             else:
+                src_color, src_label = C_EN, "EN"
                 dst_color, dst_label = C_ZH, "中"
-                src_label = "EN"
             with print_lock:
+                # 原文與翻譯配對輸出
+                print(f"{src_color}[{src_label}] {src_text}{RESET}", flush=True)
                 _print_with_badge(f"{dst_color}{BOLD}[{dst_label}] {result}{RESET}", speed_badge, elapsed)
                 print(flush=True)
                 _status_bar_state["count"] += 1
@@ -2427,6 +2711,15 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+
+    def translate_and_print(seq, src_text, log_path):
+        """背景執行緒：翻譯並按序號排隊輸出"""
+        t0 = time.monotonic()
+        result = translator.translate(src_text)
+        elapsed = time.monotonic() - t0
+        with _trans_lock:
+            _trans_pending[seq] = (src_text, result, elapsed)
+        _drain_translations(log_path)
 
     # 持續讀取輸出檔案的新內容
     last_size = 0
@@ -2506,13 +2799,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                             with open(log_path, "a", encoding="utf-8") as log_f:
                                 log_f.write(f"[{timestamp}] [EN] {line}\n\n")
                         else:
-                            # 英翻中：立刻顯示英文原文，背景翻譯
-                            with print_lock:
-                                print(f"{C_EN}[EN] {line}{RESET}", flush=True)
+                            # 英翻中：原文延後到翻譯完成時一起顯示
                             last_translated = line
+                            seq = _trans_seq[0]; _trans_seq[0] += 1
                             t = threading.Thread(
                                 target=translate_and_print,
-                                args=(line, log_path),
+                                args=(seq, line, log_path),
                                 daemon=True,
                             )
                             t.start()
@@ -2534,14 +2826,13 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                             "歡迎訂閱", "明鏡", "新聞頻道",
                         )):
                             continue
-                        # 立刻顯示中文原文
-                        with print_lock:
-                            print(f"{C_ZH}[中] {line}{RESET}", flush=True)
+                        # 原文延後到翻譯完成時一起顯示
                         last_translated = line
                         # 背景執行緒翻譯成英文
+                        seq = _trans_seq[0]; _trans_seq[0] += 1
                         t = threading.Thread(
                             target=translate_and_print,
-                            args=(line, log_path),
+                            args=(seq, line, log_path),
                             daemon=True,
                         )
                         t.start()
@@ -2602,7 +2893,8 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
 
 def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                          mode: str = "en2zh",
-                         record: bool = False, rec_device: int = None):
+                         record: bool = False, rec_device: int = None,
+                         meeting_topic: str = None):
     """使用 Moonshine ASR 引擎即時串流辨識"""
 
     # 取得 Moonshine 模型
@@ -2612,10 +2904,11 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
 
     # 翻譯記錄檔
     from datetime import datetime
-    log_prefixes = {"en2zh": "en2zh_translation", "zh2en": "zh2en_translation",
-                    "en": "en_transcribe", "zh": "zh_transcribe"}
-    log_prefix = log_prefixes.get(mode, "translation")
-    log_filename = datetime.now().strftime(f"{log_prefix}_%Y%m%d_%H%M%S.txt")
+    log_prefixes = {"en2zh": "英翻中_逐字稿", "zh2en": "中翻英_逐字稿",
+                    "en": "英文_逐字稿", "zh": "中文_逐字稿"}
+    log_prefix = log_prefixes.get(mode, "逐字稿")
+    topic_part = _topic_to_filename_part(meeting_topic)
+    log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
 
@@ -2644,15 +2937,24 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     )
     kp_thread.start()
 
-    # 非同步翻譯
+    # 非同步翻譯（有序輸出）
     print_lock = threading.Lock()
+    _trans_seq = [0]
+    _trans_pending = {}
+    _trans_next = [0]
+    _trans_lock = threading.Lock()
 
-    def translate_and_print(src_text, log_path):
-        """背景執行緒：翻譯並印出結果"""
-        t0 = time.monotonic()
-        result = translator.translate(src_text)
-        elapsed = time.monotonic() - t0
-        if result:
+    def _drain_translations(log_path):
+        """按序號依序輸出所有已就緒的翻譯結果"""
+        while True:
+            with _trans_lock:
+                entry = _trans_pending.pop(_trans_next[0], None)
+                if entry is None:
+                    break
+                _trans_next[0] += 1
+            src_text, result, elapsed = entry
+            if not result:
+                continue
             if elapsed < 1.0:
                 speed_badge = C_BADGE_FAST
             elif elapsed < 3.0:
@@ -2660,13 +2962,15 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             else:
                 speed_badge = C_BADGE_SLOW
             if mode == "zh2en":
+                src_color, src_label = C_ZH, "中"
                 dst_color, dst_label = C_EN, "EN"
-                src_label = "中"
             else:
+                src_color, src_label = C_EN, "EN"
                 dst_color, dst_label = C_ZH, "中"
-                src_label = "EN"
             with print_lock:
                 _clear_partial_line()  # 清除 [...] 部分文字
+                # 原文與翻譯配對輸出
+                print(f"{src_color}[{src_label}] {src_text}{RESET}", flush=True)
                 _print_with_badge(f"{dst_color}{BOLD}[{dst_label}] {result}{RESET}", speed_badge, elapsed)
                 print(flush=True)
                 _status_bar_state["count"] += 1
@@ -2675,6 +2979,15 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+
+    def translate_and_print(seq, src_text, log_path):
+        """背景執行緒：翻譯並按序號排隊輸出"""
+        t0 = time.monotonic()
+        result = translator.translate(src_text)
+        elapsed = time.monotonic() - t0
+        with _trans_lock:
+            _trans_pending[seq] = (src_text, result, elapsed)
+        _drain_translations(log_path)
 
     # 幻覺過濾
     last_translated = ""
@@ -2753,14 +3066,14 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                     with open(log_path, "a", encoding="utf-8") as log_f:
                         log_f.write(f"[{timestamp}] [EN] {text}\n\n")
                 else:
-                    # en2zh：顯示英文，背景翻譯
+                    # en2zh：原文延後到翻譯完成時一起顯示
                     with print_lock:
                         _clear_partial_line()
-                        print(f"{C_EN}[EN] {text}{RESET}", flush=True)
                     last_translated = text
+                    seq = _trans_seq[0]; _trans_seq[0] += 1
                     t = threading.Thread(
                         target=translate_and_print,
-                        args=(text, log_path),
+                        args=(seq, text, log_path),
                         daemon=True,
                     )
                     t.start()
@@ -2788,7 +3101,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             rec_info = sd.query_devices(rec_device)
             rec_sr = int(rec_info["default_samplerate"])
             rec_ch = max(rec_info["max_input_channels"], 1)
-            recorder = _AudioRecorder(rec_sr, rec_ch)
+            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic)
 
             def rec_callback(indata, frames, time_info, status):
                 if not stop_event.is_set():
@@ -2808,7 +3121,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                 use_separate_rec = False
         else:
             # 錄音裝置與 ASR 同一個，在 audio_callback 裡寫入
-            recorder = _AudioRecorder(sd_samplerate)
+            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic)
         if recorder:
             print(f"  {C_DIM}錄音: {recorder.path}{RESET}")
 
@@ -2887,10 +3200,10 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         "en2zh": "說英文即可看到翻譯",
         "en": "說英文即可看到字幕",
     }
-    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n", flush=True)
+    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
 
     # 設定狀態列
-    setup_status_bar(mode)
+    setup_status_bar(mode, model_name=f"Moonshine {moonshine_model_name}", asr_location="本機")
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
     # 主迴圈：等待 Ctrl+C，每 0.2 秒更新狀態列（含波形）
@@ -2913,7 +3226,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                       remote_cfg: dict, mode: str = "en2zh",
                       length_ms: int = 5000, step_ms: int = 3000,
                       record: bool = False, rec_device: int = None,
-                      force_restart: bool = False):
+                      force_restart: bool = False,
+                      meeting_topic: str = None):
     """使用遠端 GPU Whisper 即時辨識：本機 sounddevice 擷取音訊 →
     環形緩衝 → 定期上傳 WAV 到遠端 → 取回結果 → 翻譯顯示"""
     import numpy as np
@@ -2922,10 +3236,11 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
 
     # ── 翻譯記錄檔 ──
     from datetime import datetime
-    log_prefixes = {"en2zh": "en2zh_translation", "zh2en": "zh2en_translation",
-                    "en": "en_transcribe", "zh": "zh_transcribe"}
-    log_prefix = log_prefixes.get(mode, "translation")
-    log_filename = datetime.now().strftime(f"{log_prefix}_%Y%m%d_%H%M%S.txt")
+    log_prefixes = {"en2zh": "英翻中_逐字稿", "zh2en": "中翻英_逐字稿",
+                    "en": "英文_逐字稿", "zh": "中文_逐字稿"}
+    log_prefix = log_prefixes.get(mode, "逐字稿")
+    topic_part = _topic_to_filename_part(meeting_topic)
+    log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
 
@@ -2989,7 +3304,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             rec_info = sd.query_devices(rec_device)
             rec_sr = int(rec_info["default_samplerate"])
             rec_ch = max(rec_info["max_input_channels"], 1)
-            recorder = _AudioRecorder(rec_sr, rec_ch)
+            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic)
 
             def rec_callback(indata, frames, time_info, status):
                 if not stop_event.is_set():
@@ -3007,7 +3322,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 rec_stream = None
                 use_separate_rec = False
         else:
-            recorder = _AudioRecorder(sd_samplerate)
+            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic)
 
     # ── Banner ──
     print(f"{C_TITLE}{'=' * 60}{RESET}")
@@ -3101,12 +3416,23 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             wf.writeframes(pcm.tobytes())
         return wav_io.getvalue()
 
-    # ── 非同步翻譯 ──
-    def translate_and_print(src_text, _log_path):
-        t0 = time.monotonic()
-        result = translator.translate(src_text)
-        elapsed = time.monotonic() - t0
-        if result:
+    # ── 非同步翻譯（有序輸出）──
+    _trans_seq = [0]
+    _trans_pending = {}
+    _trans_next = [0]
+    _trans_lock = threading.Lock()
+
+    def _drain_translations(_log_path):
+        """按序號依序輸出所有已就緒的翻譯結果"""
+        while True:
+            with _trans_lock:
+                entry = _trans_pending.pop(_trans_next[0], None)
+                if entry is None:
+                    break
+                _trans_next[0] += 1
+            src_text, result, elapsed = entry
+            if not result:
+                continue
             if elapsed < 1.0:
                 speed_badge = C_BADGE_FAST
             elif elapsed < 3.0:
@@ -3114,12 +3440,14 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             else:
                 speed_badge = C_BADGE_SLOW
             if mode == "zh2en":
+                src_color, src_label = C_ZH, "中"
                 dst_color, dst_label = C_EN, "EN"
-                src_label = "中"
             else:
+                src_color, src_label = C_EN, "EN"
                 dst_color, dst_label = C_ZH, "中"
-                src_label = "EN"
             with print_lock:
+                # 原文與翻譯配對輸出，避免多段原文連續出現後翻譯才到
+                print(f"{src_color}[{src_label}] {src_text}{RESET}", flush=True)
                 _print_with_badge(f"{dst_color}{BOLD}[{dst_label}] {result}{RESET}", speed_badge, elapsed)
                 print(flush=True)
                 _status_bar_state["count"] += 1
@@ -3128,6 +3456,15 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             with open(_log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+
+    def translate_and_print(seq, src_text, _log_path):
+        """背景執行緒：翻譯並按序號排隊輸出"""
+        t0 = time.monotonic()
+        result = translator.translate(src_text)
+        elapsed = time.monotonic() - t0
+        with _trans_lock:
+            _trans_pending[seq] = (src_text, result, elapsed)
+        _drain_translations(_log_path)
 
     # ── 有序非同步上傳 ──
     upload_seq = [0]
@@ -3207,11 +3544,11 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 recent_texts.append(line.lower().strip())
                 # 顯示 + 翻譯
                 if mode in ("en2zh", "zh2en") and translator:
-                    with print_lock:
-                        print(f"{src_color}[{src_label}] {line}{RESET}", flush=True)
+                    # 原文延後到翻譯完成時一起顯示，避免多段 [EN] 連續出現
+                    seq = _trans_seq[0]; _trans_seq[0] += 1
                     threading.Thread(
                         target=translate_and_print,
-                        args=(line, log_path),
+                        args=(seq, line, log_path),
                         daemon=True,
                     ).start()
                 else:
@@ -3271,9 +3608,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         "en": "說英文即可看到字幕",
         "zh": "說中文即可看到字幕",
     }
-    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n", flush=True)
+    print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
 
-    setup_status_bar(mode)
+    setup_status_bar(mode, model_name=model_name, asr_location="遠端")
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
     # ── 主迴圈 ──
@@ -3404,20 +3741,36 @@ def _wait_for_esc():
         pass
 
 
+def _topic_to_filename_part(topic):
+    """將主題字串轉為檔名安全片段，最多 20 字元。無主題時回傳空字串。
+    過濾 macOS 檔名不允許的字元（/ : NUL）及其他常見問題字元。"""
+    if not topic:
+        return ""
+    # 移除 macOS 不允許的 / : 以及 Windows 不允許的 \\ * ? " < > | 和空白、控制字元
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\s]+', '_', topic)
+    # 移除開頭的 . 避免產生隱藏檔
+    safe = safe.lstrip('.')
+    safe = safe[:20].strip('_')
+    return f"_{safe}" if safe else ""
+
+
 class _AudioRecorder:
     """將即時模式的音訊錄製為 16-bit PCM WAV 檔。
-    定期更新 WAV header，即使程式異常終止也能保留已錄製的音訊。"""
+    定期更新 WAV header，即使程式異常終止也能保留已錄製的音訊。
+    close() 時自動轉檔為目標格式（預設 MP3）。"""
 
     _HEADER_UPDATE_INTERVAL = 30  # 每 30 秒更新一次 WAV header
 
-    def __init__(self, samplerate=16000, channels=1):
+    def __init__(self, samplerate=16000, channels=1, fmt=None, topic=None):
         os.makedirs(RECORDING_DIR, exist_ok=True)
         from datetime import datetime
-        fname = datetime.now().strftime("recording_%Y%m%d_%H%M%S.wav")
+        topic_part = _topic_to_filename_part(topic)
+        fname = datetime.now().strftime(f"錄音{topic_part}_%Y%m%d_%H%M%S.wav")
         self.path = os.path.join(RECORDING_DIR, fname)
         self._samplerate = samplerate
         self._channels = channels
         self._sampwidth = 2  # 16-bit
+        self._target_fmt = fmt if fmt else RECORDING_FORMAT
         # 直接操作檔案，手動寫 WAV header 以便定期更新
         self._f = open(self.path, "wb")
         self._data_size = 0
@@ -3466,12 +3819,34 @@ class _AudioRecorder:
         self._data_size += len(raw)
         self._maybe_update_header()
 
+    def _convert(self):
+        """將中間 WAV 轉檔為目標格式。成功後刪除 WAV，更新 self.path。"""
+        if self._target_fmt == "wav":
+            return
+        fmt = self._target_fmt
+        wav_path = self.path
+        out_path = os.path.splitext(wav_path)[0] + "." + fmt
+        codec_args = {
+            "mp3":  ["-codec:a", "libmp3lame", "-q:a", "0"],
+            "ogg":  ["-codec:a", "libvorbis", "-q:a", "8"],
+            "flac": ["-codec:a", "flac"],
+        }
+        args = codec_args.get(fmt, [])
+        cmd = ["ffmpeg", "-y", "-i", wav_path] + args + [out_path]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+            os.remove(wav_path)
+            self.path = out_path
+        except Exception:
+            print(f"\033[33m[警告] 錄音轉 {fmt} 失敗（保留 WAV）\033[0m")
+
     def close(self):
         try:
             self._write_header()
             self._f.close()
         except Exception:
             pass
+        self._convert()
         return self.path
 
 
@@ -3561,7 +3936,7 @@ def _ask_record_source():
         return aggregate_dev[0], aggregate_dev[1], "雙方聲音"
 
 
-def run_record_only(rec_device):
+def run_record_only(rec_device, topic=None):
     """純錄音模式：僅錄製音訊為 WAV 檔，不做 ASR 或翻譯。
     聚集裝置（ch>=3）自動分離輸出/輸入音軌並分開顯示波形。"""
     import sounddevice as sd
@@ -3577,7 +3952,7 @@ def run_record_only(rec_device):
     out_channels = rec_ch - 1 if is_aggregate else rec_ch  # 播放音軌數
     # 如果是 BlackHole (2ch)，全部都是播放音訊
 
-    recorder = _AudioRecorder(rec_sr, rec_ch)
+    recorder = _AudioRecorder(rec_sr, rec_ch, topic=topic)
     stop_event = threading.Event()
 
     # 滾動音量歷史（用於波形顯示）
@@ -3926,112 +4301,150 @@ def _ask_input_source():
 
 
 def _ask_record():
-    """互動選單：詢問是否錄製音訊，自動偵測錄音裝置。
+    """互動選單：詢問錄製音訊方式（混合/僅播放/不錄）。
     回傳 (record: bool, rec_device: int or None)"""
     import sounddevice as sd
 
-    # 先偵測錄音裝置，在選單中顯示
+    # 偵測錄音裝置
     devices = sd.query_devices()
-    rec_auto_id = None
-    rec_auto_name = None
-    rec_auto_label = None
-    # 1) 名稱匹配聚集裝置
+    aggregate_id = None
+    aggregate_name = None
+    blackhole_id = None
+    blackhole_name = None
+
+    # 1) 聚集裝置
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
             name = dev["name"]
             if "聚集" in name or "aggregate" in name.lower():
-                rec_auto_id, rec_auto_name = i, name
-                rec_auto_label = "雙方聲音"
+                aggregate_id, aggregate_name = i, name
                 break
-    # 2) 名稱不匹配但 input channels >= 3 的 Apple 虛擬裝置（使用者可能改過名稱）
-    if rec_auto_id is None:
+    # 2) input channels >= 3 的虛擬裝置（使用者可能改過聚集裝置名稱）
+    if aggregate_id is None:
         for i, dev in enumerate(devices):
             if (dev["max_input_channels"] >= 3
                     and "blackhole" not in dev["name"].lower()):
-                rec_auto_id, rec_auto_name = i, dev["name"]
-                rec_auto_label = "雙方聲音"
+                aggregate_id, aggregate_name = i, dev["name"]
                 break
-    # 3) fallback: BlackHole（僅對方聲音）
-    if rec_auto_id is None:
-        for i, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
-                rec_auto_id, rec_auto_name = i, dev["name"]
-                rec_auto_label = "僅對方聲音"
-                break
+    # 3) BlackHole
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
+            blackhole_id, blackhole_name = i, dev["name"]
+            break
+
+    has_aggregate = aggregate_id is not None
+    has_blackhole = blackhole_id is not None
 
     print(f"\n\n{C_TITLE}{BOLD}▎ 錄製音訊{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"  {C_WHITE}同時錄製音訊為 WAV 檔（儲存於 recordings/）{RESET}")
-    if rec_auto_name:
-        print(f"  {C_WHITE}錄音裝置: {rec_auto_name}（{rec_auto_label}）{RESET}")
-    print(f"  {C_DIM}* 即時辨識僅處理播放聲音，無法包含我方說話的聲音{RESET}")
+    print(f"  {C_DIM}* 即時辨識僅處理播放聲音，無法即時辨識我方說話的聲音{RESET}")
     print()
-    print(f"  {C_DIM}[1]{RESET} {C_WHITE}不錄製{RESET}")
-    print(f"  {C_HIGHLIGHT}{BOLD}[2] 錄製{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
-    print(f"{C_DIM}{'─' * 60}{RESET}")
-    print(f"{C_WHITE}選擇 (1-2) [2]：{RESET}", end=" ")
 
+    # 選項文字固定寬度對齊（「混合錄製（輸出+輸入）」顯示寬 20 全形字元）
+    _rec_label1 = "混合錄製（輸出+輸入）"  # 顯示寬 20
+    _rec_label2 = "僅錄播放聲音         "  # 補 9 空格對齊到顯示寬 21
+    if has_aggregate and has_blackhole:
+        # 三選項都可選，預設 [1]
+        print(f"  {C_HIGHLIGHT}{BOLD}[1] {_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        print(f"  {C_DIM}[2]{RESET} {C_WHITE}{_rec_label2}{RESET} {C_DIM}{blackhole_name}{RESET}")
+        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}選擇 (1-3) [1]：{RESET}", end=" ")
+        default_choice = "1"
+    elif has_blackhole:
+        # 沒有聚集裝置，[1] 不可選，預設 [2]
+        print(f"  {C_DIM}[1] {_rec_label1}  未偵測到聚集裝置{RESET}")
+        print(f"  {C_HIGHLIGHT}{BOLD}[2] {_rec_label2}{RESET} {C_DIM}{blackhole_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}選擇 (2-3) [2]：{RESET}", end=" ")
+        default_choice = "2"
+    elif has_aggregate:
+        # 有聚集但沒 BlackHole（少見），[2] 不可選，預設 [1]
+        print(f"  {C_HIGHLIGHT}{BOLD}[1] {_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        print(f"  {C_DIM}[2] {_rec_label2}  未偵測到 BlackHole{RESET}")
+        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}選擇 (1,3) [1]：{RESET}", end=" ")
+        default_choice = "1"
+    else:
+        # 都找不到 → fallback 手動選單
+        print(f"  {C_HIGHLIGHT}[提醒] 未偵測到聚集裝置或 BlackHole，請手動選擇錄音裝置{RESET}")
+        input_devices = []
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                input_devices.append((i, dev["name"], dev["max_input_channels"],
+                                      int(dev["default_samplerate"])))
+        if not input_devices:
+            print(f"  {C_DIM}無可用輸入裝置，跳過錄音{RESET}\n")
+            return False, None
+        default_id = input_devices[0][0]
+
+        print(f"\n  {C_TITLE}{BOLD}錄音裝置{RESET}")
+        for dev_id, dev_name, ch, sr in input_devices:
+            info = f"{ch}ch {sr}Hz"
+            if dev_id == default_id:
+                print(f"  {C_HIGHLIGHT}{BOLD}[{dev_id}] {dev_name}{RESET} {C_DIM}{info}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+            else:
+                print(f"  {C_DIM}[{dev_id}]{RESET} {C_WHITE}{dev_name}{RESET} {C_DIM}{info}{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}按 Enter 使用預設，或輸入裝置 ID：{RESET}", end=" ")
+
+        try:
+            dev_input = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if dev_input:
+            try:
+                selected_id = int(dev_input)
+            except ValueError:
+                selected_id = default_id
+        else:
+            selected_id = default_id
+
+        selected_name = next((n for i, n, _, _ in input_devices if i == selected_id),
+                             f"裝置 #{selected_id}")
+        print(f"  {C_OK}→ [{selected_id}] {selected_name}{RESET}\n")
+        return True, selected_id
+
+    # 讀取使用者選擇
     try:
         user_input = input().strip()
     except (EOFError, KeyboardInterrupt):
         print()
         sys.exit(0)
 
-    if user_input == "1":
+    choice = user_input if user_input else default_choice
+
+    if choice == "1" and has_aggregate:
+        print(f"  {C_OK}→ 混合錄製 [{aggregate_id}] {aggregate_name}{RESET}\n")
+        return True, aggregate_id
+    elif choice == "2" and has_blackhole:
+        print(f"  {C_OK}→ 僅錄播放聲音 [{blackhole_id}] {blackhole_name}{RESET}\n")
+        return True, blackhole_id
+    elif choice == "3":
         print(f"  {C_OK}→ 不錄製{RESET}\n")
         return False, None
-
-    print(f"  {C_OK}→ 錄製音訊{RESET}")
-
-    # 使用先前偵測到的裝置
-    if rec_auto_id is not None:
-        print(f"  {C_OK}錄音裝置: [{rec_auto_id}] {rec_auto_name}（{rec_auto_label}）{RESET}")
-        return True, rec_auto_id
-
-    # 都找不到 → fallback 顯示選單
-    print(f"{C_WARN}[提醒] 未偵測到聚集裝置或 BlackHole，請手動選擇錄音裝置{RESET}")
-    input_devices = []
-    for i, dev in enumerate(devices):
-        if dev["max_input_channels"] > 0:
-            input_devices.append((i, dev["name"], dev["max_input_channels"],
-                                  int(dev["default_samplerate"])))
-    default_id = input_devices[0][0] if input_devices else 0
-
-    print(f"\n\n{C_TITLE}{BOLD}▎ 錄音裝置{RESET}")
-    print(f"{C_DIM}{'─' * 60}{RESET}")
-    for dev_id, dev_name, ch, sr in input_devices:
-        info = f"{ch}ch {sr}Hz"
-        if dev_id == default_id:
-            print(f"  {C_HIGHLIGHT}{BOLD}[{dev_id}] {dev_name}{RESET} {C_DIM}{info}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
-        else:
-            print(f"  {C_DIM}[{dev_id}]{RESET} {C_WHITE}{dev_name}{RESET} {C_DIM}{info}{RESET}")
-    print(f"{C_DIM}{'─' * 60}{RESET}")
-    print(f"{C_WHITE}按 Enter 使用預設，或輸入裝置 ID：{RESET}", end=" ")
-
-    try:
-        dev_input = input().strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        sys.exit(0)
-
-    if dev_input:
-        try:
-            selected_id = int(dev_input)
-        except ValueError:
-            selected_id = default_id
     else:
-        selected_id = default_id
+        # 無效輸入 → 使用預設
+        if default_choice == "1":
+            print(f"  {C_OK}→ 混合錄製 [{aggregate_id}] {aggregate_name}{RESET}\n")
+            return True, aggregate_id
+        else:
+            print(f"  {C_OK}→ 僅錄播放聲音 [{blackhole_id}] {blackhole_name}{RESET}\n")
+            return True, blackhole_id
 
-    selected_name = next((n for i, n, _, _ in input_devices if i == selected_id),
-                         f"裝置 #{selected_id}")
-    print(f"  {C_OK}→ [{selected_id}] {selected_name}{RESET}\n")
-    return True, selected_id
 
-
-def _ask_topic():
-    """互動選單：詢問會議主題（可選，僅翻譯模式使用）。
+def _ask_topic(record_only=False):
+    """互動選單：詢問會議主題（可選）。
     回傳主題字串，若使用者跳過則回傳 None。"""
-    print(f"\n\n{C_TITLE}{BOLD}▎ 會議主題（選填，提升翻譯品質）{RESET}")
+    if record_only:
+        print(f"\n\n{C_TITLE}{BOLD}▎ 會議主題（選填，用做檔名參考）{RESET}")
+    else:
+        print(f"\n\n{C_TITLE}{BOLD}▎ 會議主題（選填，提升翻譯品質）{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"  {C_WHITE}輸入此次會議的主題或領域，例如：K8s 安全架構、ZFS 儲存管理{RESET}")
     print(f"  {C_DIM}若無特定主題要填寫，可直接按 Enter 跳過{RESET}")
@@ -4069,8 +4482,9 @@ class _SummaryStatusBar:
     """摘要模式的底部狀態列，類似轉錄時的風格"""
     FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    def __init__(self, model="", task=""):
-        self._model = model
+    def __init__(self, model="", task="", asr_location="", location=""):
+        _loc = location or asr_location
+        self._model = f"{model} [{_loc}]" if _loc else model
         self._task = task
         self._stop = threading.Event()
         self._thread = None
@@ -4362,7 +4776,7 @@ def _convert_to_wav(input_path):
     # 建立暫存 wav 檔名
     os.makedirs(RECORDING_DIR, exist_ok=True)
     base = os.path.splitext(os.path.basename(input_path))[0]
-    tmp_wav = os.path.join(RECORDING_DIR, f".tmp_{base}_{int(time.time())}.wav")
+    tmp_wav = os.path.join(RECORDING_DIR, f"tmp_{base}_{int(time.time())}.wav")
 
     # 取得來源檔資訊
     probe = _ffprobe_info(input_path)
@@ -4687,15 +5101,36 @@ def _diarize_segments(wav_path, segments, num_speakers=None, sbar=None):
     return speaker_labels
 
 
+def _srt_timestamp(seconds):
+    """秒數 → SRT 時間戳 HH:MM:SS,mmm"""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _segments_to_srt(segments_data, srt_path):
+    """將 segments_data 轉為 SRT 字幕檔。翻譯模式自動雙語。"""
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments_data, 1):
+            f.write(f"{i}\n")
+            f.write(f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}\n")
+            for line in seg["lines"]:
+                f.write(f"{line['text']}\n")
+            f.write("\n")
+
+
 def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo",
                        diarize=False, num_speakers=None, remote_whisper_cfg=None):
-    """處理音訊檔：ffmpeg 轉檔 → faster-whisper 辨識 → 翻譯 → 存檔，回傳 log_path"""
+    """處理音訊檔：ffmpeg 轉檔 → faster-whisper 辨識 → 翻譯 → 存檔，回傳 (log_path, html_path, session_dir)"""
     from datetime import datetime
+    import shutil
 
     # 1. 驗證檔案存在
     if not os.path.isfile(input_path):
         print(f"  {C_HIGHLIGHT}[錯誤] 檔案不存在: {input_path}{RESET}", file=sys.stderr)
-        return None
+        return None, None, None
 
     basename = os.path.splitext(os.path.basename(input_path))[0]
     print(f"\n\n{C_TITLE}{BOLD}▎ 處理: {os.path.basename(input_path)}{RESET}")
@@ -4708,7 +5143,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
     t_stage = time.monotonic()
     wav_path, is_temp = _convert_to_wav(input_path)
     if wav_path is None:
-        return None
+        return None, None, None
     t_convert_elapsed = time.monotonic() - t_stage
     if is_temp:
         out_size = os.path.getsize(wav_path)
@@ -4721,16 +5156,23 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
     lang = "zh" if mode in ("zh", "zh2en") else "en"
     need_translate = mode in ("en2zh", "zh2en")
 
-    # Log 檔名
-    log_prefixes = {"en2zh": "en2zh_translation", "zh2en": "zh2en_translation",
-                    "en": "en_transcribe", "zh": "zh_transcribe"}
-    log_prefix = log_prefixes.get(mode, "translation")
-    log_filename = datetime.now().strftime(f"{log_prefix}_{basename}_%Y%m%d_%H%M%S.txt")
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, log_filename)
+    # Log 檔名（每次處理建子目錄）
+    log_prefixes = {"en2zh": "英翻中_時間逐字稿", "zh2en": "中翻英_時間逐字稿",
+                    "en": "英文_時間逐字稿", "zh": "中文_時間逐字稿"}
+    log_prefix = log_prefixes.get(mode, "時間逐字稿")
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(LOG_DIR, f"{basename}_{ts_str}")
+    os.makedirs(session_dir, exist_ok=True)
+    log_filename = f"{log_prefix}_{basename}_{ts_str}.txt"
+    log_path = os.path.join(session_dir, log_filename)
+
+    # 複製原始音訊到子目錄（保留原始格式）
+    audio_copy = os.path.join(session_dir, os.path.basename(input_path))
+    if not os.path.exists(audio_copy):
+        shutil.copy2(input_path, audio_copy)
 
     print(f"  {C_WHITE}辨識語言    {lang}{RESET}")
-    print(f"  {C_DIM}記錄檔      logs/{log_filename}{RESET}")
+    print(f"  {C_DIM}記錄檔      {os.path.relpath(session_dir)}/{RESET}")
 
     # 標籤
     if mode in ("en2zh", "en"):
@@ -4757,9 +5199,19 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         rw_host = remote_whisper_cfg.get("host", "?")
         rw_port = remote_whisper_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
         print(f"  {C_WHITE}辨識位置    遠端 GPU（{rw_host}:{rw_port}）{RESET}")
+
+        # 上傳前檢查遠端狀態（忙碌/磁碟空間）
+        file_size = os.path.getsize(wav_path) if os.path.isfile(wav_path) else 0
+        if not _check_remote_before_upload(remote_whisper_cfg, file_size):
+            print(f"  {C_HIGHLIGHT}[降級] 改用本機 CPU 辨識{RESET}")
+            remote_whisper_cfg = None
+
+    if remote_whisper_cfg is not None:
+        rw_host = remote_whisper_cfg.get("host", "?")
+        rw_port = remote_whisper_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
         print(f"  {C_WHITE}上傳辨識中...{RESET}\n")
 
-        sbar = _SummaryStatusBar(model=model_size, task="上傳音訊").start()
+        sbar = _SummaryStatusBar(model=model_size, task="上傳音訊", asr_location="遠端").start()
 
         def _upload_progress(text):
             sbar.set_progress(text)
@@ -4792,14 +5244,14 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         except ImportError:
             print(f"  {C_HIGHLIGHT}[錯誤] faster-whisper 未安裝，請執行: pip install faster-whisper{RESET}",
                   file=sys.stderr)
-            return None
+            return None, None, None
 
         print(f"  {C_WHITE}載入模型    {model_size}...{RESET}", end=" ", flush=True)
         model = WhisperModel(model_size, device="auto", compute_type="int8")
         print(f"{C_OK}✓{RESET}")
         print(f"  {C_WHITE}辨識中...{RESET}\n")
 
-        sbar = _SummaryStatusBar(model=model_size, task="辨識中").start()
+        sbar = _SummaryStatusBar(model=model_size, task="辨識中", asr_location="本機").start()
         if audio_duration > 0:
             sbar.set_progress("0%")
 
@@ -4880,6 +5332,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
         # 輸出結果
         t_stage = time.monotonic()
+        segments_data = []  # 收集結構化資料給 HTML
         with open(log_path, "w", encoding="utf-8") as log_f:
             for i, seg in enumerate(valid_segments):
                 seg_count += 1
@@ -4893,11 +5346,15 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
                 # 講者標籤
                 spk_tag_term = ""  # 終端機用（帶色彩）
                 spk_tag_log = ""   # log 用（純文字）
+                spk_num_val = None
                 if speaker_labels is not None:
                     spk_num = speaker_labels[i] + 1  # 1-based 顯示
+                    spk_num_val = spk_num
                     spk_color = SPEAKER_COLORS[speaker_labels[i] % len(SPEAKER_COLORS)]
                     spk_tag_term = f"{spk_color}[Speaker {spk_num}]{RESET} "
                     spk_tag_log = f"[Speaker {spk_num}] "
+
+                seg_lines = []  # 本段的行資料
 
                 if need_translate and translator:
                     print(f"{src_color}{ts_tag} {spk_tag_term}[{src_label}] {text}{RESET}", flush=True)
@@ -4918,13 +5375,23 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
                         log_f.write(f"{ts_tag} {spk_tag_log}[{src_label}] {text}\n")
                         log_f.write(f"{ts_tag} {spk_tag_log}[{dst_label}] {result}\n\n")
+                        seg_lines.append({"label": src_label, "text": text})
+                        seg_lines.append({"label": dst_label, "text": result})
                     else:
                         print(flush=True)
                         log_f.write(f"{ts_tag} {spk_tag_log}[{src_label}] {text}\n\n")
+                        seg_lines.append({"label": src_label, "text": text})
                 else:
                     print(f"{src_color}{BOLD}{ts_tag} {spk_tag_term}[{src_label}] {text}{RESET}", flush=True)
                     print(flush=True)
                     log_f.write(f"{ts_tag} {spk_tag_log}[{src_label}] {text}\n\n")
+                    seg_lines.append({"label": src_label, "text": text})
+
+                segments_data.append({
+                    "start": seg["start"], "end": seg["end"],
+                    "speaker": spk_num_val,
+                    "lines": seg_lines,
+                })
 
         t_translate_elapsed = time.monotonic() - t_stage
         if need_translate and translator:
@@ -4946,13 +5413,55 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             n_spk = len(set(speaker_labels))
             diarize_info = f" | {n_spk} 位講者"
 
+        # 產生互動式 HTML 時間逐字稿
+        transcript_html_path = os.path.splitext(log_path)[0] + ".html"
+        _meta = {
+            "asr_engine": "faster-whisper",
+            "asr_model": model_size,
+            "asr_location": "遠端 GPU" if used_remote else "本機 CPU",
+            "input_file": os.path.basename(input_path),
+        }
+        if diarize:
+            _meta["diarize"] = True
+            _meta["diarize_engine"] = "resemblyzer + spectralcluster"
+            if remote_whisper_cfg is not None:
+                _meta["diarize_location"] = "遠端 GPU"
+            else:
+                _meta["diarize_location"] = "本機 CPU"
+            if num_speakers:
+                _meta["num_speakers"] = num_speakers
+            # 從 segments_data 計算實際辨識出的講者數
+            if segments_data:
+                _detected = len(set(s.get("speaker") for s in segments_data if s.get("speaker") is not None))
+                if _detected >= 2:
+                    _meta["detected_speakers"] = _detected
+        # 產出 SRT 字幕檔（在 HTML 之前，讓 HTML footer 能偵測到 SRT）
+        _srt = None
+        if segments_data:
+            srt_path = os.path.splitext(log_path)[0] + ".srt"
+            _segments_to_srt(segments_data, srt_path)
+            _srt = srt_path
+
+        if segments_data:
+            _transcript_to_html(segments_data, transcript_html_path,
+                                audio_copy, audio_duration, metadata=_meta)
+
+        _html = transcript_html_path if segments_data else None
+
         print(f"\n{C_DIM}{'═' * 60}{RESET}")
         print(f"  {C_OK}{BOLD}處理完成{RESET} {C_DIM}（共 {seg_count} 段{diarize_info} | 耗時 {total_str}）{RESET}")
         print(f"  {C_WHITE}{log_path}{RESET}")
+        if _html:
+            print(f"  {C_WHITE}{_html}{RESET}")
+        if _srt:
+            print(f"  {C_WHITE}{_srt}{RESET}")
+        if diarize and not num_speakers and speaker_labels is not None:
+            n_spk = len(set(speaker_labels))
+            print(f"  {C_DIM}講者辨識偵測到 {n_spk} 位，若不正確可用 --num-speakers N 指定重跑{RESET}")
         print(f"{C_DIM}{'═' * 60}{RESET}")
 
         sbar.stop()
-        return log_path
+        return log_path, _html, session_dir
 
     except KeyboardInterrupt:
         sbar.stop()
@@ -4967,11 +5476,108 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         if is_temp and os.path.exists(wav_path):
             os.remove(wav_path)
         print(f"\n  {C_HIGHLIGHT}[錯誤] 處理失敗: {e}{RESET}", file=sys.stderr)
-        return None
+        return None, None, None
 
 
-def summarize_log_file(input_path, model, host, port, server_type="ollama", topic=None):
+def _build_metadata_header(metadata):
+    """根據 metadata dict 產生摘要檔開頭的處理資訊區塊（純文字）"""
+    if not metadata:
+        return ""
+    lines = ["---", f"[ jt-live-whisper v{APP_VERSION} AI 摘要 ]"]
+
+    # 辨識引擎
+    asr_engine = metadata.get("asr_engine")
+    if asr_engine:
+        asr_model = metadata.get("asr_model", "")
+        asr_loc = metadata.get("asr_location", "")
+        parts = [asr_engine]
+        if asr_model:
+            parts[0] += f" ({asr_model})"
+        if asr_loc:
+            parts.append(asr_loc)
+        lines.append(f"語音辨識：{'，'.join(parts) if len(parts) > 1 else parts[0]}")
+
+    # 講者辨識
+    if metadata.get("diarize"):
+        d_engine = metadata.get("diarize_engine", "")
+        d_loc = metadata.get("diarize_location", "")
+        ns = metadata.get("num_speakers")
+        ns_str = f"{ns} 人" if isinstance(ns, int) else str(ns) if ns else "自動偵測"
+        d_parts = [p for p in [d_engine, d_loc, ns_str] if p]
+        _det = metadata.get("detected_speakers")
+        if _det and _det >= 2:
+            d_parts.append(f"辨識出 {_det} 位")
+        lines.append(f"講者辨識：{'，'.join(d_parts)}" if d_parts else "講者辨識：啟用")
+
+    # 語言翻譯
+    t_model = metadata.get("translate_model")
+    if t_model:
+        t_server = metadata.get("translate_server", "")
+        lines.append(f"語言翻譯：{t_model}" + (f" ({t_server})" if t_server else ""))
+
+    # 內容摘要
+    s_model = metadata.get("summary_model")
+    if s_model:
+        s_server = metadata.get("summary_server", "")
+        lines.append(f"內容摘要：{s_model}" + (f" ({s_server})" if s_server else ""))
+
+    # 輸入來源
+    inp = metadata.get("input_file")
+    if inp:
+        lines.append(f"來源音訊：{inp}")
+
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def _fix_speaker_labels_in_text(text):
+    """校正逐字稿中 LLM 漏掉的 Speaker 標籤：無標籤的延續段落自動補上前一位講者標籤。"""
+    lines = text.split("\n")
+    result = []
+    current_speaker = None
+    in_transcript = False
+    _spk_re = re.compile(r'^(Speaker\s*\d+)\s*[：:]\s*')
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 偵測進入校正逐字稿區段
+        if stripped.startswith("## 校正逐字稿") or stripped.startswith("##校正逐字稿"):
+            in_transcript = True
+            current_speaker = None
+            result.append(line)
+            continue
+
+        # 偵測離開（遇到下一個 ## 標題或 --- 分隔線）
+        if in_transcript and (stripped.startswith("## ") or stripped.startswith("---")):
+            in_transcript = False
+            current_speaker = None
+            result.append(line)
+            continue
+
+        if not in_transcript or not stripped:
+            result.append(line)
+            continue
+
+        # 有 Speaker 標籤：更新 current_speaker
+        m = _spk_re.match(stripped)
+        if m:
+            current_speaker = m.group(1)
+            result.append(line)
+        elif current_speaker:
+            # 無標籤的延續段落：補上前一位講者
+            result.append(f"{current_speaker}：{stripped}")
+        else:
+            result.append(line)
+
+    return "\n".join(result)
+
+
+def summarize_log_file(input_path, model, host, port, server_type="ollama",
+                       topic=None, metadata=None, summary_mode="both",
+                       audio_path=""):
     """讀取記錄檔 → 建 prompt → 呼叫 LLM → 簡繁轉換 → 寫摘要檔
+    summary_mode: "both"（摘要+逐字稿）、"summary"（只摘要）、"transcript"（只逐字稿）
     回傳 (output_path, summary_text, html_path)"""
     with open(input_path, "r", encoding="utf-8") as f:
         transcript = f.read().strip()
@@ -4983,17 +5589,25 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama", topi
     basename = os.path.basename(input_path)
     dirpath = os.path.dirname(input_path) or "."
 
-    # 依原始檔名決定摘要檔名
-    if basename.startswith("en2zh_translation"):
-        out_name = basename.replace("en2zh_translation", "en2zh_summary", 1)
-    elif basename.startswith("zh2en_translation"):
-        out_name = basename.replace("zh2en_translation", "zh2en_summary", 1)
-    elif basename.startswith("en_transcribe"):
-        out_name = basename.replace("en_transcribe", "en_summary", 1)
-    elif basename.startswith("zh_transcribe"):
-        out_name = basename.replace("zh_transcribe", "zh_summary", 1)
+    # 依原始檔名決定摘要檔名（時間逐字稿優先匹配，再匹配舊版逐字稿）
+    if basename.startswith("英翻中_時間逐字稿"):
+        out_name = basename.replace("英翻中_時間逐字稿", "英翻中_摘要", 1)
+    elif basename.startswith("中翻英_時間逐字稿"):
+        out_name = basename.replace("中翻英_時間逐字稿", "中翻英_摘要", 1)
+    elif basename.startswith("英文_時間逐字稿"):
+        out_name = basename.replace("英文_時間逐字稿", "英文_摘要", 1)
+    elif basename.startswith("中文_時間逐字稿"):
+        out_name = basename.replace("中文_時間逐字稿", "中文_摘要", 1)
+    elif basename.startswith("英翻中_逐字稿"):
+        out_name = basename.replace("英翻中_逐字稿", "英翻中_摘要", 1)
+    elif basename.startswith("中翻英_逐字稿"):
+        out_name = basename.replace("中翻英_逐字稿", "中翻英_摘要", 1)
+    elif basename.startswith("英文_逐字稿"):
+        out_name = basename.replace("英文_逐字稿", "英文_摘要", 1)
+    elif basename.startswith("中文_逐字稿"):
+        out_name = basename.replace("中文_逐字稿", "中文_摘要", 1)
     else:
-        out_name = f"summary_{basename}"
+        out_name = f"摘要_{basename}"
     output_path = os.path.join(dirpath, out_name)
 
     # 查詢模型 context window，動態決定分段大小
@@ -5008,11 +5622,12 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama", topi
     chunks = _split_transcript_chunks(transcript, max_chars)
     print()  # 空行，與下方摘要內容做視覺區隔
 
-    sbar = _SummaryStatusBar(model=model, task="準備中").start()
+    _llm_loc = "本機" if host in ("localhost", "127.0.0.1", "::1") else "遠端"
+    sbar = _SummaryStatusBar(model=model, task="準備中", location=_llm_loc).start()
 
     if len(chunks) <= 1:
         # 單段：直接摘要
-        prompt = _summary_prompt(transcript, topic=topic)
+        prompt = _summary_prompt(transcript, topic=topic, summary_mode=summary_mode)
         sbar.set_task(f"生成摘要（單段，{len(transcript)} 字）")
         summary = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                   server_type=server_type)
@@ -5021,71 +5636,141 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama", topi
         segment_summaries = []
         for i, chunk in enumerate(chunks):
             sbar.set_task(f"第 {i+1}/{len(chunks)} 段（{len(chunk)} 字）")
-            prompt = _summary_prompt(chunk, topic=topic)
+            prompt = _summary_prompt(chunk, topic=topic, summary_mode=summary_mode)
             seg = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                   server_type=server_type)
             seg = S2TWP.convert(seg)
             segment_summaries.append(seg)
             print(f"  {C_OK}第 {i+1}/{len(chunks)} 段完成{RESET}", flush=True)
 
-        # 合併各段摘要
-        sbar.set_task(f"合併 {len(chunks)} 段摘要")
-        combined = "\n\n---\n\n".join(
-            f"### 第 {i+1} 段\n{s}" for i, s in enumerate(segment_summaries)
-        )
-        merge_prompt = SUMMARY_MERGE_PROMPT_TEMPLATE.format(summaries=combined)
-        if topic:
-            merge_prompt = merge_prompt.replace(
-                "以下是各段摘要：",
-                f"- 本次會議主題：{topic}，請根據此主題的領域知識整理重點\n\n以下是各段摘要：",
+        if summary_mode == "transcript":
+            # 只要逐字稿：跳過 merge，直接串接各段校正逐字稿
+            summary = ""
+            for i, seg in enumerate(segment_summaries):
+                marker = "## 校正逐字稿"
+                idx = seg.find(marker)
+                if idx >= 0:
+                    transcript_part = seg[idx + len(marker):].strip()
+                else:
+                    transcript_part = seg.strip()
+                if len(segment_summaries) > 1:
+                    summary += f"--- 第 {i+1}/{len(segment_summaries)} 段 ---\n"
+                summary += transcript_part + "\n\n"
+        else:
+            # 合併各段摘要
+            sbar.set_task(f"合併 {len(chunks)} 段摘要")
+            combined = "\n\n---\n\n".join(
+                f"### 第 {i+1} 段\n{s}" for i, s in enumerate(segment_summaries)
             )
-        merged_summary = call_ollama_raw(merge_prompt, model, host, port, spinner=sbar, live_output=True,
-                                         server_type=server_type)
+            merge_prompt = SUMMARY_MERGE_PROMPT_TEMPLATE.format(summaries=combined)
+            if topic:
+                merge_prompt = merge_prompt.replace(
+                    "以下是各段摘要：",
+                    f"- 本次會議主題：{topic}，請根據此主題的領域知識整理重點\n\n以下是各段摘要：",
+                )
+            merged_summary = call_ollama_raw(merge_prompt, model, host, port, spinner=sbar, live_output=True,
+                                             server_type=server_type)
 
-        # 組合完整輸出：合併摘要在前，各段校正逐字稿在後
-        summary = merged_summary + "\n\n"
-        for i, seg in enumerate(segment_summaries):
-            # 從各段摘要中提取校正逐字稿部分
-            marker = "## 校正逐字稿"
-            idx = seg.find(marker)
-            if idx >= 0:
-                transcript_part = seg[idx:].strip()
+            if summary_mode == "summary":
+                # 只要摘要：跳過逐字稿提取
+                summary = merged_summary
             else:
-                transcript_part = seg.strip()
-            summary += f"--- 第 {i+1}/{len(segment_summaries)} 段 ---\n{transcript_part}\n\n"
+                # both：合併摘要在前，各段校正逐字稿在後
+                summary = merged_summary + "\n\n"
+                for i, seg in enumerate(segment_summaries):
+                    marker = "## 校正逐字稿"
+                    idx = seg.find(marker)
+                    if idx >= 0:
+                        transcript_part = seg[idx:].strip()
+                    else:
+                        transcript_part = seg.strip()
+                    summary += f"--- 第 {i+1}/{len(segment_summaries)} 段 ---\n{transcript_part}\n\n"
 
     sbar.stop()
+
+    # 偵測 LLM 是否跳過重點摘要（summary_mode="both" 時應有兩個段落）
+    if summary_mode == "both" and "## 重點摘要" not in summary:
+        print(f"\n  {C_HIGHLIGHT}[偵測] LLM 回覆缺少重點摘要段落，自動補發摘要請求...{RESET}")
+        # 使用 LLM 已校正的逐字稿（較短、較乾淨）做為重點摘要的輸入
+        _retry_input = summary
+        _marker = "## 校正逐字稿"
+        _idx = _retry_input.find(_marker)
+        if _idx >= 0:
+            _retry_input = _retry_input[_idx + len(_marker):].strip()
+        # 截斷到合理長度避免超出 context window
+        if len(_retry_input) > max_chars:
+            _retry_input = _retry_input[:max_chars]
+        _retry_topic = f"（主題：{topic}）" if topic else ""
+        _retry_prompt = f"""\
+你是專業的會議記錄整理員。請根據以下校正後的逐字稿，列出 5-10 個重點摘要{_retry_topic}，每個重點用一句話概述。
+
+輸出格式：
+
+## 重點摘要
+
+- 重點一
+- 重點二
+...
+
+規則：
+- 全部使用台灣繁體中文
+- 使用台灣用語（軟體、網路、記憶體、程式、伺服器等）
+- 嚴禁加入原文沒有的內容
+
+以下是逐字稿：
+---
+{_retry_input}
+---"""
+        sbar_retry = _SummaryStatusBar(model=model, task="補產重點摘要", location=_llm_loc).start()
+        _retry_result = call_ollama_raw(_retry_prompt, model, host, port, spinner=sbar_retry,
+                                        live_output=True, server_type=server_type)
+        sbar_retry.stop()
+        _retry_result = S2TWP.convert(_retry_result)
+        # 將重點摘要放在前面，校正逐字稿放在後面
+        summary = _retry_result.rstrip() + "\n\n" + summary.lstrip()
+        print(f"  {C_OK}重點摘要已補上{RESET}")
 
     # 簡體→台灣繁體
     summary = S2TWP.convert(summary)
 
+    # 校正逐字稿：LLM 漏掉的 Speaker 標籤，自動補上（與 HTML 邏輯對齊）
+    summary = _fix_speaker_labels_in_text(summary)
+
+    meta_header = _build_metadata_header(metadata)
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(summary + "\n")
+        f.write(meta_header + summary + "\n")
 
     # 同步產生 HTML 摘要
     html_path = os.path.splitext(output_path)[0] + ".html"
+    # 嘗試找到對應的時間逐字稿 HTML（同目錄、同基底名）
+    _transcript_html = os.path.splitext(input_path)[0] + ".html"
+    if not os.path.exists(_transcript_html):
+        _transcript_html = ""
     _summary_to_html(summary, html_path, os.path.basename(input_path),
-                     summary_txt_path=output_path, transcript_txt_path=input_path)
-    subprocess.Popen(["open", html_path])
+                     summary_txt_path=output_path, transcript_txt_path=input_path,
+                     metadata=metadata, transcript_html_path=_transcript_html,
+                     audio_path=audio_path)
 
     return output_path, summary, html_path
 
 
 def _summary_to_html(summary_text, html_path, source_name="",
-                     summary_txt_path="", transcript_txt_path=""):
+                     summary_txt_path="", transcript_txt_path="",
+                     metadata=None, transcript_html_path="",
+                     audio_path=""):
     """將摘要純文字轉為帶樣式的 HTML 檔"""
     import html as html_mod
 
     # 講者顏色（8 色循環，與終端機 SPEAKER_COLORS 對應的 HTML 色碼）
     _SPEAKER_HTML_COLORS = [
-        "#ffcb6b",  # 黃色
-        "#82aaff",  # 藍色
-        "#c3e88d",  # 綠色
-        "#f78c6c",  # 橘色
-        "#c792ea",  # 紫色
-        "#89ddff",  # 青色
-        "#ff5370",  # 紅色
-        "#a8d8a8",  # 淺綠
+        "#ffcb6b",  # 金黃
+        "#ff9a6c",  # 亮橘
+        "#c3e88d",  # 亮綠
+        "#d8a0ff",  # 亮紫
+        "#ff7090",  # 亮粉紅
+        "#50e8c0",  # 亮青綠
+        "#a0d0ff",  # 亮天藍
+        "#e0d080",  # 亮卡其
     ]
 
     lines = summary_text.split("\n")
@@ -5111,10 +5796,13 @@ def _summary_to_html(summary_text, html_path, source_name="",
             pending_br = True
             continue
 
-        # 空行後的非 speaker 行才插入 <br>（speaker 自帶 margin-top）
+        # 空行後的非 speaker 行才插入 <br>（speaker 自帶 margin-top，heading 自帶 margin-bottom）
         if pending_br:
             if not re.match(r'^\*{0,2}(Speaker \d+|講者 ?\d+)', s):
-                body_parts.append("<br>")
+                # 前一個元素是 heading 時跳過（heading 已有 margin）
+                last = body_parts[-1] if body_parts else ""
+                if not (last.startswith("<h1>") or last.startswith("<h2>")):
+                    body_parts.append("<br>")
             pending_br = False
 
         # 判斷項目類型
@@ -5186,9 +5874,10 @@ def _summary_to_html(summary_text, html_path, source_name="",
             body_parts.append(f'<p class="speaker" style="color:{color}">{escaped}</p>')
         else:
             if current_speaker is not None:
-                # 同一講者的延續段落，使用相同顏色但不加粗
+                # 同一講者的延續段落，自動補上 Speaker 標籤
                 color = _SPEAKER_HTML_COLORS[current_speaker % len(_SPEAKER_HTML_COLORS)]
-                body_parts.append(f'<p style="color:{color}">{escaped}</p>')
+                spk_label = html_mod.escape(f"Speaker {current_speaker}：")
+                body_parts.append(f'<p class="speaker" style="color:{color}"><strong>{spk_label}</strong>{escaped}</p>')
             else:
                 body_parts.append(f"<p>{escaped}</p>")
 
@@ -5211,8 +5900,62 @@ def _summary_to_html(summary_text, html_path, source_name="",
         footer_links.append(f'<a href="{txt_basename}">AI 摘要 (TXT)</a>')
     if transcript_txt_path:
         log_basename = html_mod.escape(os.path.basename(transcript_txt_path))
-        footer_links.append(f'<a href="{log_basename}">逐字稿 (TXT)</a>')
+        footer_links.append(f'<a href="{log_basename}">時間逐字稿 (TXT)</a>')
+    if transcript_html_path:
+        th_basename = html_mod.escape(os.path.basename(transcript_html_path))
+        footer_links.append(f'<a href="{th_basename}">時間逐字稿 (HTML)</a>')
+    if transcript_txt_path:
+        _srt_bn = os.path.splitext(os.path.basename(transcript_txt_path))[0] + ".srt"
+        _srt_full = os.path.join(os.path.dirname(html_path), _srt_bn)
+        if os.path.isfile(_srt_full):
+            footer_links.append(f'<a href="{html_mod.escape(_srt_bn)}">字幕檔 (SRT)</a>')
+    if audio_path and os.path.isfile(audio_path):
+        _html_dir = os.path.dirname(os.path.abspath(html_path))
+        _audio_rel = os.path.relpath(os.path.abspath(audio_path), _html_dir)
+        if _audio_rel.count("..") > 3:
+            from urllib.parse import quote as _url_quote
+            _audio_href = "file://" + _url_quote(os.path.abspath(audio_path))
+        else:
+            _audio_href = html_mod.escape(_audio_rel)
+        _audio_ext = os.path.splitext(audio_path)[1].lstrip(".").upper() or "音訊"
+        footer_links.append(f'<a href="{_audio_href}">音訊檔案 ({_audio_ext})</a>')
+    footer_links = [l.replace("<a ", '<a target="_blank" ') for l in footer_links]
     footer_html = " | ".join(footer_links)
+
+    # 建構 metadata 區塊
+    meta_lines = [f'來源檔案：{title}']
+    if metadata:
+        asr_engine = metadata.get("asr_engine")
+        if asr_engine:
+            asr_model = metadata.get("asr_model", "")
+            asr_loc = metadata.get("asr_location", "")
+            asr_str = asr_engine + (f" ({asr_model})" if asr_model else "")
+            if asr_loc:
+                asr_str += f"，{asr_loc}"
+            meta_lines.append(f'語音辨識：{asr_str}')
+        if metadata.get("diarize"):
+            d_engine = metadata.get("diarize_engine", "")
+            d_loc = metadata.get("diarize_location", "")
+            ns = metadata.get("num_speakers")
+            ns_str = f"{ns} 人" if isinstance(ns, int) else str(ns) if ns else "自動偵測"
+            d_parts = [p for p in [d_engine, d_loc, ns_str] if p]
+            _det = metadata.get("detected_speakers")
+            if _det and _det >= 2:
+                d_parts.append(f"辨識出 {_det} 位")
+            meta_lines.append(f'講者辨識：{"，".join(d_parts)}')
+        t_model = metadata.get("translate_model")
+        if t_model:
+            t_server = metadata.get("translate_server", "")
+            meta_lines.append(f'語言翻譯：{t_model}' + (f" ({t_server})" if t_server else ""))
+        s_model = metadata.get("summary_model")
+        if s_model:
+            s_server = metadata.get("summary_server", "")
+            meta_lines.append(f'內容摘要：{s_model}' + (f" ({s_server})" if s_server else ""))
+        inp = metadata.get("input_file")
+        if inp:
+            meta_lines.append(f'來源音訊：{inp}')
+    _badge = f'<span class="badge">jt-live-whisper v{APP_VERSION} AI 摘要</span>'
+    meta_html = '<div class="meta">' + _badge + "<br>\n  " + "<br>\n  ".join(html_mod.escape(l) for l in meta_lines) + '</div>'
 
     page = f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -5236,6 +5979,8 @@ def _summary_to_html(summary_text, html_path, source_name="",
   .speaker strong {{ color: inherit; }}
   strong {{ color: #f78c6c; }}
   .meta {{ color: #888; font-size: 0.85em; margin-bottom: 2em; }}
+  .badge {{ display: inline-block; background: #2d5a88; color: #c0d8f0; padding: 2px 10px;
+            border-radius: 4px; font-size: 0.85em; margin-bottom: 0.5em; }}
   .footer {{ margin-top: 3em; padding-top: 1em; border-top: 1px solid #444;
              color: #888; font-size: 0.85em; }}
   .footer a {{ color: #82aaff; text-decoration: none; margin: 0 0.3em; }}
@@ -5243,11 +5988,430 @@ def _summary_to_html(summary_text, html_path, source_name="",
 </style>
 </head>
 <body>
-<div class="meta">來源：{title} | 由 jt-live-whisper AI 摘要產生</div>
+{meta_html}
 {body_html}
 <div class="footer">
   相關檔案：{footer_html}
 </div>
+</body>
+</html>"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return html_path
+
+
+def _transcript_to_html(segments_data, html_path, audio_path, audio_duration,
+                         metadata=None, summary_html_path=None):
+    """將時間逐字稿轉為互動式 HTML：波形時間軸 + 嵌入音訊 + 點擊跳轉"""
+    import html as html_mod
+
+    _SPEAKER_HTML_COLORS = [
+        "#ffcb6b",  # 1: 金黃
+        "#ff9a6c",  # 2: 亮橘
+        "#c3e88d",  # 3: 亮綠
+        "#d8a0ff",  # 4: 亮紫
+        "#ff7090",  # 5: 亮粉紅
+        "#50e8c0",  # 6: 亮青綠
+        "#a0d0ff",  # 7: 亮天藍
+        "#e0d080",  # 8: 亮卡其
+    ]
+
+    # 音訊路徑：相對路徑或 file:// URI
+    html_dir = os.path.dirname(os.path.abspath(html_path))
+    audio_abs = os.path.abspath(audio_path)
+    audio_rel = os.path.relpath(audio_abs, html_dir)
+    if audio_rel.count("..") > 3:
+        from urllib.parse import quote
+        audio_src = "file://" + quote(audio_abs)
+    else:
+        audio_src = html_mod.escape(audio_rel)
+
+    # 建構波形資料：從音訊取 RMS 振幅，分 ~200 bin
+    import json
+    import struct
+    import math
+
+    NUM_BINS = 200
+    rms_bins = [0.0] * NUM_BINS
+
+    # 嘗試讀取 WAV 原始音訊計算 RMS
+    _wav_for_rms = None
+    if audio_path.lower().endswith(".wav") and os.path.isfile(audio_path):
+        _wav_for_rms = audio_path
+    else:
+        # 非 WAV：嘗試找 process_audio_file 產生的暫存 WAV（已清理則跳過）
+        _tmp_wav = os.path.splitext(audio_path)[0] + ".wav"
+        if os.path.isfile(_tmp_wav):
+            _wav_for_rms = _tmp_wav
+
+    if _wav_for_rms and audio_duration > 0:
+        try:
+            import wave
+            with wave.open(_wav_for_rms, "rb") as wf_audio:
+                n_ch = wf_audio.getnchannels()
+                sw = wf_audio.getsampwidth()
+                sr = wf_audio.getframerate()
+                n_frames = wf_audio.getnframes()
+                frames_per_bin = max(n_frames // NUM_BINS, 1)
+
+                fmt_map = {1: "b", 2: "<h", 4: "<i"}
+                fmt_char = fmt_map.get(sw, "<h")
+                max_val = float(2 ** (sw * 8 - 1))
+
+                for b in range(NUM_BINS):
+                    chunk = wf_audio.readframes(frames_per_bin)
+                    if not chunk:
+                        break
+                    samples = struct.unpack(fmt_char * (len(chunk) // sw), chunk)
+                    # mono mixdown
+                    if n_ch > 1:
+                        mono = []
+                        for j in range(0, len(samples), n_ch):
+                            mono.append(sum(samples[j:j+n_ch]) / n_ch)
+                        samples = mono
+                    if samples:
+                        rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / max_val
+                        rms_bins[b] = rms
+        except Exception:
+            pass  # 讀取失敗就用預設值
+
+    # 如果 WAV 讀取失敗，降級用 ffmpeg 快速取樣
+    if max(rms_bins) == 0 and audio_duration > 0 and os.path.isfile(audio_path):
+        try:
+            bin_dur = audio_duration / NUM_BINS
+            cmd = ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", "8000",
+                   "-f", "s16le", "-v", "quiet", "-"]
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            if proc.returncode == 0 and proc.stdout:
+                raw = proc.stdout
+                samples_per_bin = max(len(raw) // 2 // NUM_BINS, 1)
+                for b in range(NUM_BINS):
+                    start_idx = b * samples_per_bin
+                    end_idx = min(start_idx + samples_per_bin, len(raw) // 2)
+                    if start_idx >= len(raw) // 2:
+                        break
+                    chunk_samples = struct.unpack(f"<{end_idx - start_idx}h",
+                                                  raw[start_idx*2:end_idx*2])
+                    if chunk_samples:
+                        rms = math.sqrt(sum(s * s for s in chunk_samples) / len(chunk_samples)) / 32768.0
+                        rms_bins[b] = rms
+        except Exception:
+            pass
+
+    # 對應每個 bin 的 speaker
+    bin_speakers = [None] * NUM_BINS
+    if audio_duration > 0:
+        bin_dur = audio_duration / NUM_BINS
+        for seg in segments_data:
+            spk = seg.get("speaker")
+            if spk is None:
+                continue
+            b_start = int(seg["start"] / bin_dur)
+            b_end = int(math.ceil(seg["end"] / bin_dur))
+            for b in range(max(0, b_start), min(NUM_BINS, b_end)):
+                bin_speakers[b] = spk
+
+    waveform_data = []
+    for b in range(NUM_BINS):
+        waveform_data.append({
+            "rms": round(rms_bins[b], 4),
+            "spk": bin_speakers[b],
+        })
+
+    waveform_json = json.dumps(waveform_data, ensure_ascii=False)
+
+    # 建構段落 HTML
+    seg_parts = []
+    for seg in segments_data:
+        start_sec = int(seg["start"])
+        ts_start = _format_timestamp(seg["start"])
+        ts_end = _format_timestamp(seg["end"])
+        ts_text = f"{ts_start}-{ts_end}"
+
+        spk = seg.get("speaker")
+        lines_html = []
+        has_pair = len(seg["lines"]) >= 2
+        for li, ln in enumerate(seg["lines"]):
+            label = html_mod.escape(ln["label"])
+            text = html_mod.escape(ln["text"])
+            is_dst = has_pair and li >= 1
+            line_cls = "line line-dst" if is_dst else "line"
+            if spk is not None:
+                color = _SPEAKER_HTML_COLORS[(spk - 1) % len(_SPEAKER_HTML_COLORS)]
+                lines_html.append(
+                    f'<div class="{line_cls}" style="color:{color}">'
+                    f'<span class="spk">Speaker {spk}</span> '
+                    f'[{label}] {text}</div>'
+                )
+            else:
+                lines_html.append(
+                    f'<div class="{line_cls}">[{label}] {text}</div>'
+                )
+
+        seg_parts.append(
+            f'<div class="seg" id="t-{start_sec}">\n'
+            f'  <a class="ts" data-t="{seg["start"]}" href="#">{ts_text}</a>\n'
+            f'  {"".join(lines_html)}\n'
+            f'</div>'
+        )
+    body_html = "\n".join(seg_parts)
+
+    # metadata 區塊
+    title = html_mod.escape(os.path.basename(audio_path))
+    meta_lines = [f'來源音訊：{title}']
+    if metadata:
+        asr_engine = metadata.get("asr_engine")
+        if asr_engine:
+            asr_model = metadata.get("asr_model", "")
+            asr_loc = metadata.get("asr_location", "")
+            asr_str = asr_engine + (f" ({asr_model})" if asr_model else "")
+            if asr_loc:
+                asr_str += f"，{asr_loc}"
+            meta_lines.append(f'語音辨識：{asr_str}')
+        if metadata.get("diarize"):
+            d_engine = metadata.get("diarize_engine", "")
+            d_loc = metadata.get("diarize_location", "")
+            ns = metadata.get("num_speakers")
+            ns_str = f"{ns} 人" if isinstance(ns, int) else str(ns) if ns else "自動偵測"
+            d_parts = [p for p in [d_engine, d_loc, ns_str] if p]
+            _det = metadata.get("detected_speakers")
+            if _det and _det >= 2:
+                d_parts.append(f"辨識出 {_det} 位")
+            meta_lines.append(f'講者辨識：{"，".join(d_parts)}')
+
+    _badge = f'<span class="badge">jt-live-whisper v{APP_VERSION} 時間逐字稿</span>'
+    meta_html = '<div class="meta">' + _badge + "<br>\n  " + "<br>\n  ".join(
+        html_mod.escape(l) for l in meta_lines) + '</div>'
+
+    # footer 連結（與摘要 HTML 對稱：四個檔案）
+    footer_links = []
+    html_basename = html_mod.escape(os.path.basename(html_path))
+    footer_links.append(f'<a href="{html_basename}">時間逐字稿 (HTML)</a>')
+    txt_path = os.path.splitext(html_path)[0] + ".txt"
+    txt_basename = html_mod.escape(os.path.basename(txt_path))
+    footer_links.append(f'<a href="{txt_basename}">時間逐字稿 (TXT)</a>')
+    # 推算對應的摘要檔名（時間逐字稿 → 摘要）
+    _txt_bn = os.path.basename(txt_path)
+    _sum_bn = _txt_bn
+    for _old, _new in [("英翻中_時間逐字稿", "英翻中_摘要"), ("中翻英_時間逐字稿", "中翻英_摘要"),
+                        ("英文_時間逐字稿", "英文_摘要"), ("中文_時間逐字稿", "中文_摘要")]:
+        if _txt_bn.startswith(_old):
+            _sum_bn = _txt_bn.replace(_old, _new, 1)
+            break
+    if _sum_bn != _txt_bn:
+        _sum_html_bn = html_mod.escape(os.path.splitext(_sum_bn)[0] + ".html")
+        _sum_txt_bn = html_mod.escape(_sum_bn)
+        footer_links.append(f'<a href="{_sum_html_bn}">AI 摘要 (HTML)</a>')
+        footer_links.append(f'<a href="{_sum_txt_bn}">AI 摘要 (TXT)</a>')
+    elif summary_html_path:
+        sum_basename = html_mod.escape(os.path.basename(summary_html_path))
+        footer_links.append(f'<a href="{sum_basename}">AI 摘要 (HTML)</a>')
+    _srt_bn = os.path.splitext(os.path.basename(txt_path))[0] + ".srt"
+    _srt_full = os.path.join(os.path.dirname(html_path), _srt_bn)
+    if os.path.isfile(_srt_full):
+        footer_links.append(f'<a href="{html_mod.escape(_srt_bn)}">字幕檔 (SRT)</a>')
+    _audio_ext = os.path.splitext(audio_path)[1].lstrip(".").upper() or "音訊"
+    footer_links.append(f'<a href="{audio_src}">音訊檔案 ({_audio_ext})</a>')
+    footer_links = [l.replace("<a ", '<a target="_blank" ') for l in footer_links]
+    footer_html = " | ".join(footer_links)
+
+    dur_str = f"{audio_duration:.2f}" if audio_duration else "0"
+
+    # 段落時間資料（給 JS timeupdate 用）
+    seg_times = [{"start": round(s["start"], 2), "end": round(s["end"], 2)}
+                 for s in segments_data]
+    seg_times_json = json.dumps(seg_times, ensure_ascii=False)
+
+    page = f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} - 時間逐字稿</title>
+<style>
+  body {{ font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+         max-width: 800px; margin: 0 auto; padding: 0 20px;
+         background: #1a1a2e; color: #e0e0e0; line-height: 1.8; }}
+  .meta {{ color: #888; font-size: 0.85em; margin-bottom: 1em; padding-top: 40px; }}
+  .badge {{ display: inline-block; background: #2d5a88; color: #c0d8f0; padding: 2px 10px;
+            border-radius: 4px; font-size: 0.85em; margin-bottom: 0.5em; }}
+  .sticky-player {{ position: sticky; top: 0; z-index: 100; background: #1a1a2e;
+                     padding: 8px 0 4px; border-bottom: 1px solid #2a2a4a; }}
+  audio {{ width: 100%; margin: 0 0 6px; }}
+  .waveform {{ position: relative; width: 100%; height: 50px; background: #12122a;
+               border-radius: 6px; cursor: pointer; overflow: hidden; }}
+  .waveform .bar {{ position: absolute; bottom: 0; background: #3a5a8a; border-radius: 2px 2px 0 0;
+                    min-width: 2px; transition: background 0.15s; }}
+  .waveform .bar:hover {{ background: #82aaff; }}
+  .waveform .tooltip {{ position: absolute; top: -28px; background: #222; color: #ccc;
+                         padding: 2px 8px; border-radius: 4px; font-size: 0.75em;
+                         pointer-events: none; display: none; white-space: nowrap; }}
+  .waveform .playhead {{ position: absolute; top: 0; bottom: 0; width: 2px;
+                          background: #ff5370; pointer-events: none; display: none; }}
+  .seg {{ padding: 8px 0; border-bottom: 1px solid #2a2a4a; transition: background 0.3s, border-color 0.3s;
+          position: relative; }}
+  .seg.active {{ background: #1e2a4a; border-radius: 4px; }}
+  .seg.playing {{ background: #1a2844; border-left: 3px solid #e8e060; padding-left: 8px; padding-right: 12px;
+                  border-radius: 0 6px 6px 0; z-index: 2;
+                  box-shadow: 0 0 15px rgba(232,224,96,0.35), 0 0 30px rgba(232,224,96,0.12);
+                  outline: 1.5px solid rgba(232,224,96,0.4); }}
+  .ts {{ display: inline-block; background: #2a2a4a; color: #9a9ac0; padding: 1px 8px;
+         border-radius: 3px; text-decoration: none; font-size: 0.8em; font-family: monospace;
+         cursor: pointer; margin-bottom: 4px; }}
+  .ts:hover {{ background: #3a3a5a; color: #c0c0e0; }}
+  .ts::before {{ content: "\u23f5 "; }}
+  .line {{ margin: 2px 0 2px 1em; }}
+  .line-dst {{ opacity: 0.7; font-size: 0.92em; margin-left: 1.5em; }}
+  .spk {{ font-weight: bold; }}
+  .footer {{ margin-top: 3em; padding-top: 1em; padding-bottom: 3em; border-top: 1px solid #444;
+             color: #888; font-size: 0.85em; }}
+  .footer a {{ color: #82aaff; text-decoration: none; margin: 0 0.3em; }}
+  .footer a:hover {{ text-decoration: underline; }}
+</style>
+</head>
+<body>
+{meta_html}
+<div class="sticky-player">
+  <audio id="player" controls preload="metadata">
+    <source src="{audio_src}">
+  </audio>
+  <div class="waveform" id="waveform">
+    <div class="tooltip" id="wf-tip"></div>
+    <div class="playhead" id="playhead"></div>
+  </div>
+</div>
+{body_html}
+<div class="footer">
+  相關檔案：{footer_html}
+</div>
+<script>
+(function() {{
+  var player = document.getElementById('player');
+  var wf = document.getElementById('waveform');
+  var tip = document.getElementById('wf-tip');
+  var playhead = document.getElementById('playhead');
+  var dur = {dur_str};
+  var bins = {waveform_json};
+
+  // 建立段落時間索引（從 DOM 的 .ts[data-t] 讀取，最可靠）
+  var tsEls = document.querySelectorAll('.ts');
+  var segList = [];
+  tsEls.forEach(function(a, i) {{
+    var st = parseFloat(a.getAttribute('data-t'));
+    var next = (i + 1 < tsEls.length) ? parseFloat(tsEls[i+1].getAttribute('data-t')) : dur;
+    segList.push({{ start: st, end: next, el: a.closest('.seg') }});
+  }});
+
+  // 繪製波形（RMS 振幅 bin）
+  if (dur > 0 && bins.length > 0) {{
+    var maxRms = Math.max.apply(null, bins.map(function(s) {{ return s.rms; }})) || 0.01;
+    var colors = {json.dumps(_SPEAKER_HTML_COLORS)};
+    var barW = 100.0 / bins.length;
+    bins.forEach(function(s, i) {{
+      var bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.left = (i * barW) + '%';
+      bar.style.width = Math.max(barW, 0.3) + '%';
+      var h = Math.max((s.rms / maxRms) * 44 + 2, 2);
+      bar.style.height = h + 'px';
+      if (s.spk != null) {{
+        bar.style.background = colors[(s.spk - 1) % colors.length];
+        bar.style.opacity = '0.7';
+      }}
+      wf.appendChild(bar);
+    }});
+  }}
+
+  function fmtTime(t) {{
+    var h = Math.floor(t / 3600);
+    var m = Math.floor((t % 3600) / 60);
+    var s = Math.floor(t % 60);
+    if (h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+  }}
+
+  // tooltip（時:分:秒）
+  wf.addEventListener('mousemove', function(e) {{
+    if (dur <= 0) return;
+    var rect = wf.getBoundingClientRect();
+    var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    tip.textContent = fmtTime(pct * dur);
+    tip.style.left = Math.min(e.clientX - rect.left, rect.width - 50) + 'px';
+    tip.style.display = 'block';
+  }});
+  wf.addEventListener('mouseleave', function() {{ tip.style.display = 'none'; }});
+
+  // click 波形跳轉
+  var skipAutoScroll = false;
+  wf.addEventListener('click', function(e) {{
+    if (dur <= 0) return;
+    var rect = wf.getBoundingClientRect();
+    var pct = (e.clientX - rect.left) / rect.width;
+    var t = pct * dur;
+    skipAutoScroll = true;
+    player.currentTime = t;
+    player.play();
+    // 手動跳到最近段落
+    var best = findSeg(t);
+    if (best) {{
+      setPlaying(best);
+      best.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+    }}
+    setTimeout(function() {{ skipAutoScroll = false; }}, 1500);
+  }});
+
+  // 時間戳點擊
+  tsEls.forEach(function(a) {{
+    a.addEventListener('click', function(e) {{
+      e.preventDefault();
+      skipAutoScroll = true;
+      var t = parseFloat(this.getAttribute('data-t'));
+      player.currentTime = t;
+      player.play();
+      setPlaying(this.closest('.seg'));
+      setTimeout(function() {{ skipAutoScroll = false; }}, 1500);
+    }});
+  }});
+
+  // playhead + 段落跟隨
+  var lastPlayingEl = null;
+  player.addEventListener('timeupdate', function() {{
+    if (dur <= 0) return;
+    var ct = player.currentTime;
+    playhead.style.left = (ct / dur * 100) + '%';
+    playhead.style.display = 'block';
+
+    var el = findSeg(ct);
+    if (el && el !== lastPlayingEl) {{
+      setPlaying(el);
+      if (!skipAutoScroll) {{
+        el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+      }}
+    }}
+  }});
+
+  player.addEventListener('pause', function() {{
+    if (lastPlayingEl) {{ lastPlayingEl.classList.remove('playing'); lastPlayingEl = null; }}
+  }});
+
+  function findSeg(t) {{
+    for (var i = 0; i < segList.length; i++) {{
+      if (t >= segList[i].start && t < segList[i].end) return segList[i].el;
+    }}
+    // 落在最後一段之後
+    if (segList.length > 0 && t >= segList[segList.length-1].start) {{
+      return segList[segList.length-1].el;
+    }}
+    return null;
+  }}
+
+  function setPlaying(el) {{
+    if (lastPlayingEl) lastPlayingEl.classList.remove('playing');
+    if (el) el.classList.add('playing');
+    lastPlayingEl = el;
+  }}
+}})();
+</script>
 </body>
 </html>"""
     with open(html_path, "w", encoding="utf-8") as f:
@@ -5330,18 +6494,22 @@ _status_bar_state = {
     "start_time": 0.0,   # monotonic 起始時間
     "count": 0,          # 翻譯/轉錄筆數
     "mode": "en2zh",     # 功能模式
+    "model_name": "",    # 模型名稱（如 large-v3-turbo）
+    "asr_location": "",  # ASR 位置（"本機" / "遠端"）
     "rms_history": None,  # deque(maxlen=12)，由 setup_status_bar 初始化
     "rms_lock": None,     # threading.Lock
     "paused": False,     # Ctrl+P 暫停狀態
 }
 
 
-def setup_status_bar(mode="en2zh"):
+def setup_status_bar(mode="en2zh", model_name="", asr_location=""):
     """設定終端機底部固定狀態列，利用 scroll region 讓字幕只在上方滾動"""
     global _status_bar_active
     _status_bar_state["start_time"] = time.monotonic()
     _status_bar_state["count"] = 0
     _status_bar_state["mode"] = mode
+    _status_bar_state["model_name"] = model_name
+    _status_bar_state["asr_location"] = asr_location
     _status_bar_state["rms_history"] = deque(maxlen=12)
     _status_bar_state["rms_lock"] = threading.Lock()
     _status_bar_state["paused"] = False
@@ -5428,15 +6596,35 @@ def _draw_status_bar(rows=None, cols=None):
                 samples = samples[-12:]
             wave_str = "".join(_rms_to_bar(s) for s in samples)
         wave_colored = f"\x1b[38;2;80;200;120m{wave_str}\x1b[38;2;200;200;200m" if wave_str else ""
+        # 模型 + ASR 位置欄位
+        model_part = ""
+        model_part_display = ""
+        m_name = _status_bar_state.get("model_name", "")
+        m_loc = _status_bar_state.get("asr_location", "")
+        if m_name:
+            if m_loc:
+                model_part = f"{m_name} [{m_loc}]"
+                model_part_display = f"{m_name} \x1b[38;2;100;180;255m[{m_loc}]\x1b[38;2;200;200;200m"
+            else:
+                model_part = m_name
+                model_part_display = m_name
         if _status_bar_state.get("paused"):
             pause_str = "\x1b[38;2;255;220;80m\u23f8 \u5df2\u66ab\u505c\x1b[38;2;200;200;200m"
             hotkey_str = "Ctrl+P \u7e7c\u7e8c | Ctrl+C \u505c\u6b62"
-            status = f" {time_str} {wave_str} | \u23f8 \u5df2\u66ab\u505c | {hotkey_str} "
-            status_display = f" {time_str} {wave_colored} | {pause_str} | {hotkey_str} "
+            if model_part:
+                status = f" {time_str} {wave_str} | {model_part} | \u23f8 \u5df2\u66ab\u505c | {hotkey_str} "
+                status_display = f" {time_str} {wave_colored} | {model_part_display} | {pause_str} | {hotkey_str} "
+            else:
+                status = f" {time_str} {wave_str} | \u23f8 \u5df2\u66ab\u505c | {hotkey_str} "
+                status_display = f" {time_str} {wave_colored} | {pause_str} | {hotkey_str} "
         else:
             hotkey_str = "Ctrl+P \u66ab\u505c | Ctrl+C \u505c\u6b62"
-            status = f" {time_str} {wave_str} | {label} {count} \u7b46 | {hotkey_str} "
-            status_display = f" {time_str} {wave_colored} | {label} {count} \u7b46 | {hotkey_str} "
+            if model_part:
+                status = f" {time_str} {wave_str} | {model_part} | {label} {count} \u7b46 | {hotkey_str} "
+                status_display = f" {time_str} {wave_colored} | {model_part_display} | {label} {count} \u7b46 | {hotkey_str} "
+            else:
+                status = f" {time_str} {wave_str} | {label} {count} \u7b46 | {hotkey_str} "
+                status_display = f" {time_str} {wave_colored} | {label} {count} \u7b46 | {hotkey_str} "
         # 計算顯示寬度（中文字佔 2 格）
         dw = sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in status)
         padding = " " * max(0, cols - dw)
@@ -5576,7 +6764,7 @@ def parse_args():
         help="LLM 翻譯模型名稱 (預設 qwen2.5:14b)")
     parser.add_argument(
         "--llm-host", metavar="HOST", dest="ollama_host",
-        help=f"LLM 伺服器位址，自動偵測 Ollama 或 OpenAI 相容 (預設 {OLLAMA_HOST}:{OLLAMA_PORT})")
+        help="LLM 伺服器位址，自動偵測 Ollama 或 OpenAI 相容 (例如 192.168.1.40:11434)")
     parser.add_argument(
         "--list-devices", action="store_true",
         help="列出可用音訊裝置後離開")
@@ -5644,7 +6832,7 @@ def resolve_model(model_name):
 
 
 def _resolve_ollama_host(args):
-    """從 args 解析 LLM 伺服器 host/port"""
+    """從 args 解析 LLM 伺服器 host/port，無設定時回傳 (None, port)"""
     host, port = OLLAMA_HOST, OLLAMA_PORT
     if args.ollama_host:
         if ":" in args.ollama_host:
@@ -5657,6 +6845,102 @@ def _resolve_ollama_host(args):
         else:
             host = args.ollama_host
     return host, port
+
+
+def _build_cli_command(**kwargs):
+    """根據設定組裝等效的 ./start.sh CLI 指令字串（所有有值的參數都明確列出）"""
+    import shlex
+    parts = ["./start.sh"]
+
+    input_files = kwargs.get("input_files")
+    if input_files:
+        parts.append("--input")
+        for f in input_files:
+            parts.append(shlex.quote(f))
+
+    mode = kwargs.get("mode")
+    if mode:
+        parts.append(f"--mode {mode}")
+
+    model = kwargs.get("model")
+    if model:
+        parts.append(f"-m {model}")
+
+    asr = kwargs.get("asr")
+    if asr:
+        parts.append(f"--asr {asr}")
+
+    moonshine_model = kwargs.get("moonshine_model")
+    if moonshine_model:
+        parts.append(f"--moonshine-model {moonshine_model}")
+
+    scene = kwargs.get("scene")
+    if scene:
+        parts.append(f"-s {scene}")
+
+    engine = kwargs.get("engine")
+    if engine:
+        parts.append(f"-e {engine}")
+
+    llm_model = kwargs.get("llm_model")
+    if llm_model:
+        parts.append(f"--llm-model {shlex.quote(llm_model)}")
+
+    llm_host = kwargs.get("llm_host")
+    if llm_host:
+        parts.append(f"--llm-host {shlex.quote(llm_host)}")
+
+    topic = kwargs.get("topic")
+    if topic:
+        parts.append(f"--topic {shlex.quote(topic)}")
+
+    device = kwargs.get("device")
+    if device is not None:
+        parts.append(f"-d {device}")
+
+    diarize = kwargs.get("diarize")
+    if diarize:
+        parts.append("--diarize")
+
+    num_speakers = kwargs.get("num_speakers")
+    if num_speakers:
+        parts.append(f"--num-speakers {num_speakers}")
+
+    summarize = kwargs.get("summarize")
+    if summarize:
+        parts.append("--summarize")
+
+    summary_model = kwargs.get("summary_model")
+    if summary_model:
+        parts.append(f"--summary-model {shlex.quote(summary_model)}")
+
+    record = kwargs.get("record")
+    if record:
+        parts.append("--record")
+
+    rec_device = kwargs.get("rec_device")
+    if rec_device is not None:
+        parts.append(f"--rec-device {rec_device}")
+
+    local_asr = kwargs.get("local_asr")
+    if local_asr:
+        parts.append("--local-asr")
+
+    return " ".join(parts)
+
+
+def _confirm_start(cli_cmd):
+    """印出等效 CLI 指令，詢問 Y/n 確認。回傳 True 繼續、False 取消。"""
+    print(f"  {C_DIM}等效指令    {RESET}{C_OK}{cli_cmd}{RESET}")
+    print(f"  {C_DIM}            （下次可直接執行，不需進入互動選單）{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    try:
+        ans = input(f"\n{C_WHITE}確認開始？({C_HIGHLIGHT}Y{C_WHITE}/n)：{RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans in ("", "y", "yes"):
+        return True
+    return False
 
 
 def main():
@@ -5685,28 +6969,61 @@ def main():
         if args.mode == "record":
             print("[錯誤] 純錄音模式不適用於離線處理（--input）", file=sys.stderr)
             sys.exit(1)
-        # 決定參數來源：有 --mode → CLI 模式；沒有 → 互動選單
-        if args.mode is None:
+        # 決定參數來源：有任何使用者明確傳入的 CLI 參數 → CLI 模式；全無 → 互動選單
+        # 注意：args.summary_model 有 argparse 預設值，不能用來判斷
+        _has_cli_args = (args.mode is not None or args.model or
+                         args.diarize or
+                         args.num_speakers or args.summarize is not None or
+                         args.engine or args.ollama_model or
+                         args.ollama_host or
+                         args.local_asr or getattr(args, 'topic', None))
+        if not _has_cli_args:
             (mode, fw_model, ollama_model, summary_model,
              host, port, diarize, num_speakers, do_summarize,
-             server_type, use_remote_whisper, meeting_topic) = _input_interactive_menu(args)
+             server_type, use_remote_whisper, meeting_topic,
+             summary_mode) = _input_interactive_menu(args)
             engine = "llm"
             if not server_type:
                 server_type = "ollama"
         else:
-            mode = args.mode
+            mode = args.mode or "en2zh"
             diarize = args.diarize
             num_speakers = args.num_speakers
             do_summarize = args.summarize is not None
-            fw_model = args.model or "large-v3-turbo"
-            engine = args.engine or "llm"
-            ollama_model = args.ollama_model or "qwen2.5:14b"
-            summary_model = args.summary_model
+            summary_mode = "both"  # CLI 模式預設
+            _default_fw = "large-v3" if mode in ("zh", "zh2en") else "large-v3-turbo"
+            fw_model = args.model or _default_fw
             host, port = _resolve_ollama_host(args)
             server_type = None  # CLI 模式稍後偵測
+            need_translate_cli = mode in ("en2zh", "zh2en")
+            ollama_model = None
+            if need_translate_cli:
+                if args.engine or args.ollama_model or args.ollama_host:
+                    # 有指定任何翻譯相關參數 → 隱含 -e llm
+                    engine = args.engine or "llm"
+                else:
+                    # 未指定翻譯參數：自動偵測或用互動選單
+                    engine, _sel_model, _sel_host, _sel_port, _sel_srv = select_translator(host, port)
+                    if engine == "llm":
+                        ollama_model = _sel_model
+                        if _sel_host: host = _sel_host
+                        if _sel_port: port = _sel_port
+                        if _sel_srv: server_type = _sel_srv
+                if engine == "llm" and not ollama_model:
+                    if not server_type:
+                        server_type = _detect_llm_server(host, port)
+                    if host:
+                        ollama_model = args.ollama_model or _select_llm_model(host, port, server_type or "ollama")
+                    else:
+                        # 無 LLM 伺服器，降級 Argos
+                        engine = "argos"
+            else:
+                engine = "llm"
+            summary_model = args.summary_model
             # 遠端 GPU：有設定且未指定 --local-asr
             use_remote_whisper = (REMOTE_WHISPER_CONFIG is not None
                                  and not args.local_asr)
+            meeting_topic = getattr(args, 'topic', None)
 
         # --diarize 檢查 resemblyzer / spectralcluster
         if diarize:
@@ -5726,9 +7043,16 @@ def main():
         if not ollama_model:
             ollama_model = "qwen2.5:14b"
 
-        # 一開始就檢查 LLM 伺服器連線
+        # ── 連線檢查 ──
         ollama_available = False
         need_llm_translate = need_translate and engine == "llm"
+        need_remote_asr = use_remote_whisper and REMOTE_WHISPER_CONFIG
+        need_check = need_llm_translate or do_summarize or need_remote_asr
+
+        if need_check:
+            print(f"\n\n{C_TITLE}{BOLD}▎ 連線檢查{RESET}")
+            print(f"{C_DIM}{'─' * 60}{RESET}")
+
         if need_llm_translate or do_summarize:
             if not server_type:
                 server_type = _detect_llm_server(host, port)
@@ -5748,9 +7072,7 @@ def main():
         if not server_type:
             server_type = "ollama"
 
-        # 初始化翻譯器（CLI 模式用 args.topic；互動選單已在上方解包 meeting_topic）
-        if args.mode is not None:
-            meeting_topic = args.topic
+        # 初始化翻譯器（meeting_topic 已在互動選單或 CLI 分支中設定）
         translator = None
         can_summarize = ollama_available
         if need_translate:
@@ -5778,7 +7100,7 @@ def main():
 
         # 遠端 GPU 啟動與 health check
         remote_whisper_cfg = None
-        if use_remote_whisper and REMOTE_WHISPER_CONFIG:
+        if need_remote_asr:
             rw_cfg = REMOTE_WHISPER_CONFIG
             rw_host = rw_cfg.get("host", "?")
             rw_port = rw_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
@@ -5810,25 +7132,52 @@ def main():
         if remote_whisper_cfg:
             rw_h = remote_whisper_cfg.get("host", "?")
             print(f"  {C_WHITE}辨識位置    遠端 GPU（{rw_h}）{RESET}")
+        else:
+            print(f"  {C_WHITE}辨識位置    本機 CPU{RESET}")
+        if need_translate:
+            if engine == "argos":
+                print(f"  {C_WHITE}翻譯模型    Argos 本機離線{RESET}")
+            else:
+                _srv_disp = f"{ollama_model} @ {host}:{port}"
+                print(f"  {C_WHITE}翻譯模型    {_srv_disp}{RESET}")
         if diarize:
-            sp_info = f"啟用（{num_speakers} 人）" if num_speakers else "啟用（自動偵測）"
+            sp_info = "resemblyzer + spectralcluster"
             if remote_whisper_cfg:
                 sp_info += f"，遠端 GPU（{remote_whisper_cfg.get('host', '?')}）"
             else:
                 sp_info += "，本機 CPU"
+            sp_info += f"，{num_speakers} 人" if num_speakers else "，自動偵測"
             print(f"  {C_WHITE}講者辨識    {sp_info}{RESET}")
+        if do_summarize and host:
+            print(f"  {C_WHITE}摘要模型    {summary_model} @ {host}:{port}{RESET}")
+        if meeting_topic:
+            print(f"  {C_WHITE}會議主題    {meeting_topic}{RESET}")
         print(f"  {C_WHITE}檔案數      {RESET}{C_DIM}{len(args.input)}{RESET}")
-        print(f"{C_DIM}{'─' * 60}{RESET}")
+
+        # CLI 指令回顯 + 確認（在設定總覽區塊內）
+        _cli_kw = dict(input_files=args.input, mode=mode, model=fw_model,
+                       diarize=diarize, num_speakers=num_speakers,
+                       summarize=do_summarize, summary_model=summary_model,
+                       engine=engine if engine == "argos" else None,
+                       llm_model=ollama_model if need_translate and engine == "llm" else None,
+                       llm_host=f"{host}:{port}" if need_translate and engine == "llm" and host else None,
+                       topic=meeting_topic,
+                       local_asr=args.local_asr)
+        if not _confirm_start(_build_cli_command(**_cli_kw)):
+            sys.exit(0)
 
         # 逐檔處理
-        log_paths = []
+        log_paths = []  # list of (log_path, original_input_path, session_dir)
+        html_to_open = []  # 收集所有 HTML，最後一起開啟
         try:
             for fpath in args.input:
-                log_path = process_audio_file(fpath, mode, translator, model_size=fw_model,
-                                              diarize=diarize, num_speakers=num_speakers,
-                                              remote_whisper_cfg=remote_whisper_cfg)
+                log_path, t_html, session_dir = process_audio_file(fpath, mode, translator, model_size=fw_model,
+                                                       diarize=diarize, num_speakers=num_speakers,
+                                                       remote_whisper_cfg=remote_whisper_cfg)
                 if log_path:
-                    log_paths.append(log_path)
+                    log_paths.append((log_path, fpath, session_dir))
+                if t_html:
+                    html_to_open.append(t_html)
         except KeyboardInterrupt:
             remaining = len(args.input) - len(log_paths)
             if remaining > 1:
@@ -5843,25 +7192,74 @@ def main():
             print(f"\n\n{C_TITLE}{BOLD}▎ 自動摘要{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
             print(f"  {C_DIM}摘要模型: {summary_model} ({host}:{port}){RESET}")
+            srv_label = "Ollama" if server_type == "ollama" else "OpenAI 相容"
 
-            for lp in log_paths:
+            for lp, orig_fpath, sess_dir in log_paths:
                 print(f"\n  {C_DIM}摘要: {os.path.basename(lp)}{RESET}")
                 t_summary_start = time.monotonic()
+                # 用子目錄中的音訊副本
+                audio_in_session = os.path.join(sess_dir, os.path.basename(orig_fpath))
+                # 組裝 metadata
+                _meta = {
+                    "asr_engine": remote_whisper_cfg.get("_backend", "faster-whisper") if remote_whisper_cfg else "faster-whisper",
+                    "asr_model": fw_model,
+                    "asr_location": f"遠端 GPU ({remote_whisper_cfg.get('host', '?')})" if remote_whisper_cfg else "本機 CPU",
+                    "diarize": diarize,
+                    "diarize_engine": "resemblyzer + spectralcluster" if diarize else None,
+                    "diarize_location": f"遠端 GPU ({remote_whisper_cfg.get('host', '?')})" if diarize and remote_whisper_cfg else ("本機 CPU" if diarize else None),
+                    "num_speakers": num_speakers if num_speakers else "自動偵測",
+                    "translate_model": ollama_model if need_translate and ollama_available else None,
+                    "translate_server": f"{srv_label} @ {host}:{port}" if need_translate and ollama_available else None,
+                    "input_format": os.path.splitext(orig_fpath)[1].lstrip(".").lower(),
+                    "input_file": os.path.basename(orig_fpath),
+                    "summary_model": summary_model,
+                    "summary_server": f"{srv_label} @ {host}:{port}",
+                }
+                # 從逐字稿計算實際講者數
+                if diarize:
+                    try:
+                        with open(lp, "r", encoding="utf-8") as _lf:
+                            _spk_set = set()
+                            for _ll in _lf:
+                                _sm = re.search(r'\[Speaker (\d+)\]', _ll)
+                                if _sm:
+                                    _spk_set.add(int(_sm.group(1)))
+                            if len(_spk_set) >= 2:
+                                _meta["detected_speakers"] = len(_spk_set)
+                    except Exception:
+                        pass
                 try:
                     out_path, _, html_path = summarize_log_file(lp, summary_model, host, port,
                                                                   server_type=server_type,
-                                                                  topic=meeting_topic)
+                                                                  topic=meeting_topic,
+                                                                  metadata=_meta,
+                                                                  summary_mode=summary_mode,
+                                                                  audio_path=audio_in_session)
                     if out_path:
+                        if html_path:
+                            html_to_open.append(html_path)
                         t_summary_elapsed = time.monotonic() - t_summary_start
                         s_min, s_sec = divmod(int(t_summary_elapsed), 60)
                         s_str = f"{s_min}m{s_sec:02d}s" if s_min else f"{t_summary_elapsed:.1f}s"
+                        _save_labels = {"both": "含重點摘要 + 校正逐字稿", "summary": "重點摘要", "transcript": "校正逐字稿"}
+                        _save_label = _save_labels.get(summary_mode, "含重點摘要 + 校正逐字稿")
                         print(f"\n{C_DIM}{'═' * 60}{RESET}")
-                        print(f"  {C_OK}{BOLD}摘要已儲存（含重點摘要 + 校正逐字稿）{RESET} {C_DIM}[{s_str}]{RESET}")
+                        print(f"  {C_OK}{BOLD}摘要已儲存（{_save_label}）{RESET} {C_DIM}[{s_str}]{RESET}")
                         print(f"  {C_WHITE}{out_path}{RESET}")
                         print(f"  {C_WHITE}{html_path}{RESET}")
                         print(f"{C_DIM}{'═' * 60}{RESET}")
                 except Exception as e:
                     print(f"  {C_HIGHLIGHT}[錯誤] 摘要失敗: {e}{RESET}")
+
+        # 所有處理完成後一起開啟 HTML + 子目錄
+        for hp in html_to_open:
+            subprocess.Popen(["open", hp])
+        # 開啟每個 session 子目錄（Finder）
+        opened_dirs = set()
+        for _, _, sess_dir in log_paths:
+            if sess_dir and sess_dir not in opened_dirs:
+                opened_dirs.add(sess_dir)
+                subprocess.Popen(["open", sess_dir])
 
         if not log_paths:
             print(f"\n{C_HIGHLIGHT}沒有成功處理的檔案{RESET}")
@@ -5927,16 +7325,16 @@ def main():
 
             # 用第一個檔案名決定摘要檔名
             first_base = os.path.basename(valid_files[0])
-            if first_base.startswith("en2zh_translation"):
-                out_name = "en2zh_summary_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
-            elif first_base.startswith("zh2en_translation"):
-                out_name = "zh2en_summary_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
-            elif first_base.startswith("en_transcribe"):
-                out_name = "en_summary_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
-            elif first_base.startswith("zh_transcribe"):
-                out_name = "zh_summary_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+            if first_base.startswith("英翻中_逐字稿"):
+                out_name = "英翻中_摘要_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+            elif first_base.startswith("中翻英_逐字稿"):
+                out_name = "中翻英_摘要_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+            elif first_base.startswith("英文_逐字稿"):
+                out_name = "英文_摘要_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+            elif first_base.startswith("中文_逐字稿"):
+                out_name = "中文_摘要_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
             else:
-                out_name = "summary_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+                out_name = "摘要_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
             os.makedirs(LOG_DIR, exist_ok=True)
             output_path = os.path.join(LOG_DIR, out_name)
 
@@ -5950,11 +7348,14 @@ def main():
             combined_transcript = combined_transcript.strip()
             chunks = _split_transcript_chunks(combined_transcript, max_chars)
             print()  # 空行，與下方摘要內容做視覺區隔
-            sbar = _SummaryStatusBar(model=model, task="準備中").start()
+            _llm_loc = "本機" if host in ("localhost", "127.0.0.1", "::1") else "遠端"
+            sbar = _SummaryStatusBar(model=model, task="準備中", location=_llm_loc).start()
 
             _batch_topic = getattr(args, 'topic', None)
+            _batch_summary_mode = "both"  # --summarize 批次模式預設
             if len(chunks) <= 1:
-                prompt = _summary_prompt(combined_transcript, topic=_batch_topic)
+                prompt = _summary_prompt(combined_transcript, topic=_batch_topic,
+                                         summary_mode=_batch_summary_mode)
                 sbar.set_task(f"生成摘要（單段，{len(combined_transcript)} 字）")
                 summary = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                           server_type=server_type)
@@ -5962,7 +7363,8 @@ def main():
                 segment_summaries = []
                 for i, chunk in enumerate(chunks):
                     sbar.set_task(f"第 {i+1}/{len(chunks)} 段（{len(chunk)} 字）")
-                    prompt = _summary_prompt(chunk, topic=_batch_topic)
+                    prompt = _summary_prompt(chunk, topic=_batch_topic,
+                                             summary_mode=_batch_summary_mode)
                     seg = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                           server_type=server_type)
                     seg = S2TWP.convert(seg)
@@ -5995,17 +7397,65 @@ def main():
 
             sbar._task = "完成"
             sbar.freeze()
+
+            # 偵測 LLM 是否跳過重點摘要
+            if _batch_summary_mode == "both" and "## 重點摘要" not in summary:
+                print(f"\n  {C_HIGHLIGHT}[偵測] LLM 回覆缺少重點摘要段落，自動補發摘要請求...{RESET}")
+                _retry_input = summary
+                _marker = "## 校正逐字稿"
+                _idx = _retry_input.find(_marker)
+                if _idx >= 0:
+                    _retry_input = _retry_input[_idx + len(_marker):].strip()
+                if len(_retry_input) > max_chars:
+                    _retry_input = _retry_input[:max_chars]
+                _retry_topic = f"（主題：{_batch_topic}）" if _batch_topic else ""
+                _retry_prompt = f"""\
+你是專業的會議記錄整理員。請根據以下校正後的逐字稿，列出 5-10 個重點摘要{_retry_topic}，每個重點用一句話概述。
+
+輸出格式：
+
+## 重點摘要
+
+- 重點一
+- 重點二
+...
+
+規則：
+- 全部使用台灣繁體中文
+- 使用台灣用語（軟體、網路、記憶體、程式、伺服器等）
+- 嚴禁加入原文沒有的內容
+
+以下是逐字稿：
+---
+{_retry_input}
+---"""
+                sbar_retry = _SummaryStatusBar(model=model, task="補產重點摘要", location=_llm_loc).start()
+                _retry_result = call_ollama_raw(_retry_prompt, model, host, port, spinner=sbar_retry,
+                                                live_output=True, server_type=server_type)
+                sbar_retry.stop()
+                _retry_result = S2TWP.convert(_retry_result)
+                summary = _retry_result.rstrip() + "\n\n" + summary.lstrip()
+                print(f"  {C_OK}重點摘要已補上{RESET}")
+
             summary = S2TWP.convert(summary)
 
+            # 組裝 metadata（批次摘要只有摘要模型資訊）
+            _batch_meta = {
+                "summary_model": model,
+                "summary_server": f"{srv_label} @ {host}:{port}",
+                "input_file": ", ".join(os.path.basename(f) for f in valid_files),
+            }
+            meta_header = _build_metadata_header(_batch_meta)
             with open(output_path, "w", encoding="utf-8") as f:
-                f.write(summary + "\n")
+                f.write(meta_header + summary + "\n")
 
             # 同步產生 HTML 摘要
             html_path = os.path.splitext(output_path)[0] + ".html"
             source_name = os.path.basename(valid_files[0]) if valid_files else ""
             transcript_path = valid_files[0] if valid_files else ""
             _summary_to_html(summary, html_path, source_name,
-                             summary_txt_path=output_path, transcript_txt_path=transcript_path)
+                             summary_txt_path=output_path, transcript_txt_path=transcript_path,
+                             metadata=_batch_meta)
             subprocess.Popen(["open", html_path])
 
             t_batch_elapsed = time.monotonic() - t_batch_start
@@ -6053,14 +7503,21 @@ def main():
                 print("[錯誤] 找不到任何音訊輸入裝置！", file=sys.stderr)
                 sys.exit(1)
             print(f"{C_OK}錄音裝置: [{rec_id}] {rec_name}（{rec_label}）{RESET}")
-            run_record_only(rec_id)
+            _cli_kw = dict(mode="record", device=rec_id, topic=args.topic)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
+            run_record_only(rec_id, topic=args.topic)
             sys.exit(0)
 
         # 決定 ASR 引擎
         if args.asr:
             asr_engine = args.asr
+        elif args.model:
+            # -m 指定的是 Whisper 模型，隱含使用 Whisper
+            asr_engine = "whisper"
         elif mode in ("en2zh", "en") and _MOONSHINE_AVAILABLE:
-            asr_engine = "moonshine"
+            # 沒指定 --asr 也沒指定 -m，讓使用者選
+            asr_engine = select_asr_engine()
         else:
             asr_engine = "whisper"
         # 中文模式強制 whisper
@@ -6084,13 +7541,23 @@ def main():
                 capture_id = auto_select_device_sd()
 
             translator = None
-            meeting_topic = args.topic if mode in ("en2zh", "zh2en") else None
+            meeting_topic = args.topic
             host, port = _resolve_ollama_host(args)
             srv_type = _detect_llm_server(host, port) or "ollama"
             if mode in ("en2zh", "zh2en"):
-                engine = args.engine or "llm"
+                ollama_model = None
+                if args.engine or args.ollama_model or args.ollama_host:
+                    engine = args.engine or "llm"
+                else:
+                    engine, _sel_model, _sel_host, _sel_port, _sel_srv = select_translator(host, port)
+                    if engine == "llm":
+                        ollama_model = _sel_model
+                        if _sel_host: host = _sel_host
+                        if _sel_port: port = _sel_port
+                        if _sel_srv: srv_type = _sel_srv
                 if engine == "llm":
-                    ollama_model = args.ollama_model or "qwen2.5:14b"
+                    if not ollama_model:
+                        ollama_model = args.ollama_model or _select_llm_model(host, port, srv_type)
                     translator = OllamaTranslator(ollama_model, host, port, direction=mode,
                                                   server_type=srv_type,
                                                   meeting_topic=meeting_topic)
@@ -6112,11 +7579,20 @@ def main():
                   f"裝置: {capture_id} | 翻譯: {engine}{RESET}")
             if meeting_topic:
                 print(f"{C_DIM}會議主題: {meeting_topic}{RESET}")
+            _cli_kw = dict(mode=mode, model=model_name, device=args.device,
+                           scene=args.scene, topic=meeting_topic,
+                           llm_model=ollama_model if mode in ("en2zh", "zh2en") and engine == "llm" else None,
+                           engine=engine if mode in ("en2zh", "zh2en") else None,
+                           llm_host=f"{host}:{port}" if mode in ("en2zh", "zh2en") and engine == "llm" else None,
+                           record=args.record, rec_device=args.rec_device)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
             print()
             run_stream_remote(capture_id, translator, model_name, REMOTE_WHISPER_CONFIG,
                               mode, length_ms, step_ms,
                               record=args.record, rec_device=args.rec_device,
-                              force_restart=args.restart_server)
+                              force_restart=args.restart_server,
+                              meeting_topic=meeting_topic)
         elif asr_engine == "moonshine":
             check_dependencies(asr_engine)
             # Moonshine 模式
@@ -6130,11 +7606,21 @@ def main():
             translator = None
             host, port = _resolve_ollama_host(args)
             srv_type = _detect_llm_server(host, port) or "ollama"
-            meeting_topic = args.topic if mode in ("en2zh", "zh2en") else None
+            meeting_topic = args.topic
             if mode == "en2zh":
-                engine = args.engine or "llm"
+                ollama_model = None
+                if args.engine or args.ollama_model or args.ollama_host:
+                    engine = args.engine or "llm"
+                else:
+                    engine, _sel_model, _sel_host, _sel_port, _sel_srv = select_translator(host, port)
+                    if engine == "llm":
+                        ollama_model = _sel_model
+                        if _sel_host: host = _sel_host
+                        if _sel_port: port = _sel_port
+                        if _sel_srv: srv_type = _sel_srv
                 if engine == "llm":
-                    ollama_model = args.ollama_model or "qwen2.5:14b"
+                    if not ollama_model:
+                        ollama_model = args.ollama_model or _select_llm_model(host, port, srv_type)
                     translator = OllamaTranslator(ollama_model, host, port, direction=mode,
                                                   server_type=srv_type,
                                                   meeting_topic=meeting_topic)
@@ -6150,9 +7636,18 @@ def main():
                   f"裝置: {capture_id} | 翻譯: {engine if mode == 'en2zh' else '無'}{RESET}")
             if meeting_topic:
                 print(f"{C_DIM}會議主題: {meeting_topic}{RESET}")
+            _cli_kw = dict(mode=mode, asr="moonshine", moonshine_model=ms_model_name,
+                           device=args.device, topic=meeting_topic,
+                           llm_model=ollama_model if mode == "en2zh" and engine == "llm" else None,
+                           engine=engine if mode == "en2zh" else None,
+                           llm_host=f"{host}:{port}" if mode == "en2zh" and engine == "llm" else None,
+                           record=args.record, rec_device=args.rec_device)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
             print()
             run_stream_moonshine(capture_id, translator, ms_model_name, mode,
-                                 record=args.record, rec_device=args.rec_device)
+                                 record=args.record, rec_device=args.rec_device,
+                                 meeting_topic=meeting_topic)
         else:
             check_dependencies(asr_engine)
             # Whisper 本機模式（原有邏輯）
@@ -6177,13 +7672,23 @@ def main():
                 capture_id = auto_select_device(model_path)
 
             translator = None
-            meeting_topic = args.topic if mode in ("en2zh", "zh2en") else None
+            meeting_topic = args.topic
             host, port = _resolve_ollama_host(args)
             srv_type = _detect_llm_server(host, port) or "ollama"
             if mode in ("en2zh", "zh2en"):
-                engine = args.engine or "llm"
+                ollama_model = None
+                if args.engine or args.ollama_model or args.ollama_host:
+                    engine = args.engine or "llm"
+                else:
+                    engine, _sel_model, _sel_host, _sel_port, _sel_srv = select_translator(host, port)
+                    if engine == "llm":
+                        ollama_model = _sel_model
+                        if _sel_host: host = _sel_host
+                        if _sel_port: port = _sel_port
+                        if _sel_srv: srv_type = _sel_srv
                 if engine == "llm":
-                    ollama_model = args.ollama_model or "qwen2.5:14b"
+                    if not ollama_model:
+                        ollama_model = args.ollama_model or _select_llm_model(host, port, srv_type)
                     translator = OllamaTranslator(ollama_model, host, port, direction=mode,
                                                   server_type=srv_type,
                                                   meeting_topic=meeting_topic)
@@ -6202,9 +7707,18 @@ def main():
                   f"裝置: {capture_id} | 翻譯: {engine}{RESET}")
             if meeting_topic:
                 print(f"{C_DIM}會議主題: {meeting_topic}{RESET}")
+            _cli_kw = dict(mode=mode, model=model_name, scene=args.scene,
+                           device=args.device, topic=meeting_topic,
+                           llm_model=ollama_model if mode in ("en2zh", "zh2en") and engine == "llm" else None,
+                           engine=engine if mode in ("en2zh", "zh2en") else None,
+                           llm_host=f"{host}:{port}" if mode in ("en2zh", "zh2en") and engine == "llm" else None,
+                           record=args.record, rec_device=args.rec_device)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
             print()
             run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
-                       record=args.record, rec_device=args.rec_device)
+                       record=args.record, rec_device=args.rec_device,
+                       meeting_topic=meeting_topic)
     else:
         # 互動式選單
         mode = select_mode()
@@ -6213,7 +7727,11 @@ def main():
         if mode == "record":
             rec_id, rec_name, rec_label = _ask_record_source()
             print(f"  {C_OK}錄音裝置: [{rec_id}] {rec_name}（{rec_label}）{RESET}")
-            run_record_only(rec_id)
+            meeting_topic = _ask_topic(record_only=True)
+            _cli_kw = dict(mode="record", device=rec_id, topic=meeting_topic)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
+            run_record_only(rec_id, topic=meeting_topic)
             sys.exit(0)
 
         # 辨識位置（遠端 GPU / 本機），僅在有設定時顯示
@@ -6251,9 +7769,18 @@ def main():
             # 音訊裝置（PortAudio，不是 SDL2）
             capture_id = list_audio_devices_sd()
 
+            _cli_kw = dict(mode=mode, model=r_model_name, device=capture_id,
+                           topic=meeting_topic,
+                           record=record, rec_device=rec_device,
+                           engine=engine if mode in ("en2zh", "zh2en") else None,
+                           llm_model=model if mode in ("en2zh", "zh2en") and engine == "llm" else None,
+                           llm_host=f"{host}:{port}" if mode in ("en2zh", "zh2en") and engine == "llm" else None)
+            if not _confirm_start(_build_cli_command(**_cli_kw)):
+                sys.exit(0)
             run_stream_remote(capture_id, translator, r_model_name, REMOTE_WHISPER_CONFIG,
                               mode, record=record, rec_device=rec_device,
-                              force_restart=args.restart_server)
+                              force_restart=args.restart_server,
+                              meeting_topic=meeting_topic)
         else:
             # ── 本機路徑：既有流程 ──
 
@@ -6269,7 +7796,7 @@ def main():
             translator = None
             meeting_topic = None
             s_host, s_port = OLLAMA_HOST, OLLAMA_PORT
-            s_server_type = "ollama"
+            s_server_type = None
             if asr_engine == "moonshine" and mode == "en2zh":
                 engine, model, host, port, srv_type = select_translator()
                 meeting_topic = _ask_topic()
@@ -6302,14 +7829,33 @@ def main():
             if asr_engine == "moonshine":
                 ms_model_name = select_moonshine_model()
                 capture_id = list_audio_devices_sd()
+                _cli_kw = dict(mode=mode, asr="moonshine", moonshine_model=ms_model_name,
+                               device=capture_id, topic=meeting_topic,
+                               record=record, rec_device=rec_device,
+                               engine=engine if mode == "en2zh" and engine else None,
+                               llm_model=model if mode == "en2zh" and engine == "llm" else None,
+                               llm_host=f"{host}:{port}" if mode == "en2zh" and engine == "llm" else None)
+                if not _confirm_start(_build_cli_command(**_cli_kw)):
+                    sys.exit(0)
                 run_stream_moonshine(capture_id, translator, ms_model_name, mode,
-                                     record=record, rec_device=rec_device)
+                                     record=record, rec_device=rec_device,
+                                     meeting_topic=meeting_topic)
             else:
                 model_name, model_path = select_whisper_model(mode)
                 length_ms, step_ms = select_scene()
                 capture_id = list_audio_devices(model_path)
+                _need_llm = mode in ("en2zh", "zh2en") and engine == "llm"
+                _cli_kw = dict(mode=mode, model=model_name,
+                               device=capture_id, topic=meeting_topic,
+                               record=record, rec_device=rec_device,
+                               engine=engine if mode in ("en2zh", "zh2en") else None,
+                               llm_model=model if _need_llm else None,
+                               llm_host=f"{host}:{port}" if _need_llm else None)
+                if not _confirm_start(_build_cli_command(**_cli_kw)):
+                    sys.exit(0)
                 run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
-                           record=record, rec_device=rec_device)
+                           record=record, rec_device=rec_device,
+                           meeting_topic=meeting_topic)
 
 
 if __name__ == "__main__":

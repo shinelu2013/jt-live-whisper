@@ -124,7 +124,7 @@ spinner_stop() {
 print_title() {
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v1.9.4 - 即時英翻中字幕系統 - 安裝程式${NC}"
+    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.0.9 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
     echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
     echo -e "${C_TITLE}============================================================${NC}"
     echo ""
@@ -149,6 +149,85 @@ section() {
     echo ""
     echo -e "${C_TITLE}${BOLD}▎ $1${NC}"
     echo -e "${C_DIM}$( printf '─%.0s' {1..50} )${NC}"
+}
+
+# ─── 環境前置檢查 ────────────────────────────────
+check_macos_version() {
+    section "macOS 版本"
+    local ver
+    ver=$(sw_vers -productVersion 2>/dev/null)
+    if [ -z "$ver" ]; then
+        check_fail "無法偵測 macOS 版本"
+        return 1
+    fi
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    if [ "$major" -lt 13 ]; then
+        check_fail "macOS $ver 不支援（最低需要 macOS 13 Ventura，whisper.cpp Metal 加速需要）"
+        return 1
+    fi
+    check_ok "macOS $ver"
+}
+
+check_xcode_clt() {
+    section "Xcode Command Line Tools"
+    if xcode-select -p &>/dev/null; then
+        check_ok "Xcode CLT 已安裝（$(xcode-select -p)）"
+    else
+        check_install "Xcode Command Line Tools 未安裝，正在觸發安裝..."
+        xcode-select --install 2>/dev/null || true
+        echo -e "  ${C_WHITE}請在彈出的視窗中按「安裝」，完成後重新執行 ./install.sh${NC}"
+        return 1
+    fi
+}
+
+check_internet() {
+    section "網路連線"
+    # 依序測試三個關鍵來源，任一成功即可
+    local ok=0
+    for url in "https://github.com" "https://pypi.org" "https://brew.sh"; do
+        if curl -s --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null | grep -qE '^[23]'; then
+            ok=1
+            break
+        fi
+    done
+    if [ "$ok" -eq 1 ]; then
+        check_ok "網路連線正常"
+    else
+        check_fail "無法連線至 GitHub / PyPI / Homebrew，請確認網路連線"
+        return 1
+    fi
+}
+
+check_running_processes() {
+    section "執行中程序檢查"
+    local found=0
+    local pids
+    # 檢查 whisper-stream
+    pids=$(pgrep -f "whisper-stream" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo -e "  ${C_WARN}[警告]${NC} whisper-stream 正在執行中（PID: $pids）"
+        echo -e "  ${C_DIM}重新編譯可能失敗，建議先關閉${NC}"
+        found=1
+    fi
+    # 檢查 translate_meeting.py
+    pids=$(pgrep -f "translate_meeting.py" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo -e "  ${C_WARN}[警告]${NC} translate_meeting.py 正在執行中（PID: $pids）"
+        echo -e "  ${C_DIM}安裝期間可能衝突，建議先關閉${NC}"
+        found=1
+    fi
+    if [ "$found" -eq 1 ]; then
+        echo ""
+        read -p "  是否仍然繼續安裝？(y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    else
+        check_ok "無衝突程序"
+    fi
 }
 
 # ─── Homebrew ────────────────────────────────────
@@ -213,7 +292,21 @@ install_brew_cask() {
 check_brew_deps() {
     section "系統套件 (Homebrew)"
     install_brew_formula "cmake" "CMake 建構工具"
-    install_brew_formula "sdl2" "SDL2 音訊函式庫"
+    # SDL 音訊函式庫：優先 SDL2（whisper.cpp 目前使用），未來 SDL3 可用時自動切換
+    if brew list --formula 2>/dev/null | grep -q "^sdl2$"; then
+        check_ok "SDL2 音訊函式庫 (sdl2)"
+    elif brew list --formula 2>/dev/null | grep -q "^sdl3$"; then
+        check_ok "SDL3 音訊函式庫 (sdl3)"
+        echo -e "  ${C_WARN}[注意]${NC} whisper.cpp 尚未正式支援 SDL3，若編譯失敗請安裝 SDL2: brew install sdl2"
+    else
+        # 兩者都沒有，嘗試安裝 SDL2
+        install_brew_formula "sdl2" "SDL2 音訊函式庫"
+        # SDL2 安裝失敗時嘗試 SDL3（未來 Homebrew 可能只有 SDL3）
+        if ! brew list --formula 2>/dev/null | grep -q "^sdl2$"; then
+            echo -e "  ${C_WARN}[備選]${NC} SDL2 安裝失敗，嘗試安裝 SDL3..."
+            install_brew_formula "sdl3" "SDL3 音訊函式庫"
+        fi
+    fi
     install_brew_formula "ffmpeg" "FFmpeg 音訊轉檔工具"
     install_brew_cask "blackhole-2ch" "BlackHole 虛擬音訊"
 }
@@ -320,20 +413,32 @@ check_whisper_cpp() {
         rm -rf "$WHISPER_DIR/build"
         cd "$WHISPER_DIR"
 
-        # 偵測架構，選擇正確的 SDL2 路徑
+        # 偵測 SDL 版本（優先 SDL2，未來相容 SDL3）
+        local sdl_cmake_flag="-DWHISPER_SDL2=ON"
+        local sdl_prefix=""
+        if brew list --formula 2>/dev/null | grep -q "^sdl2$"; then
+            sdl_cmake_flag="-DWHISPER_SDL2=ON"
+            echo -e "  ${C_DIM}使用 SDL2${NC}"
+        elif brew list --formula 2>/dev/null | grep -q "^sdl3$"; then
+            # whisper.cpp 未來可能用 -DWHISPER_SDL3=ON，先嘗試
+            sdl_cmake_flag="-DWHISPER_SDL3=ON"
+            echo -e "  ${C_WARN}使用 SDL3（實驗性）${NC}"
+        fi
+
+        # 偵測架構
         local arch
         arch=$(uname -m)
         local cmake_extra_flags=""
         if [ "$arch" = "arm64" ]; then
-            # Apple Silicon: 使用 ARM Homebrew SDL2 + Metal
-            if [ -d "/opt/homebrew/Cellar/sdl2" ]; then
+            # Apple Silicon: ARM Homebrew + Metal
+            if [ -d "/opt/homebrew/Cellar/sdl2" ] || [ -d "/opt/homebrew/Cellar/sdl3" ]; then
                 cmake_extra_flags="-DCMAKE_OSX_ARCHITECTURES=arm64 -DWHISPER_METAL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16 -DCMAKE_PREFIX_PATH=/opt/homebrew"
             fi
         fi
 
         local ncpu
         ncpu=$(sysctl -n hw.ncpu)
-        run_spinner "編譯中..." bash -c "cd '$WHISPER_DIR' && cmake -B build -DWHISPER_SDL2=ON $cmake_extra_flags 2>&1 && cmake --build build --target whisper-stream -j$ncpu 2>&1"
+        run_spinner "編譯中..." bash -c "cd '$WHISPER_DIR' && cmake -B build $sdl_cmake_flag $cmake_extra_flags 2>&1 && cmake --build build --target whisper-stream -j$ncpu 2>&1"
         echo ""
         cd "$SCRIPT_DIR"
 
@@ -633,13 +738,300 @@ do_upgrade() {
     return 0
 }
 
+# ─── 從原始碼編譯 CTranslate2（aarch64 CUDA）──────────────
+# 用法：_build_ctranslate2_from_source "$ssh_opts" "$rw_user" "$rw_host"
+# 回傳：0=成功  1=失敗（呼叫端應降級 openai-whisper）
+_build_ctranslate2_from_source() {
+    local ssh_opts="$1" rw_user="$2" rw_host="$3"
+    local REMOTE_PIP="~/jt-whisper-server/venv/bin/pip"
+    local REMOTE_PY="~/jt-whisper-server/venv/bin/python3"
+    local WHEEL_CACHE="~/jt-whisper-server/.ct2-wheels"
+    local BUILD_DIR="/tmp/ctranslate2-build"
+
+    echo ""
+    echo -e "  ${C_WHITE}[CTranslate2] aarch64 偵測到，嘗試從原始碼編譯 CUDA 版...${NC}"
+
+    # ── 1. 檢查快取 wheel ──
+    local cached_whl
+    cached_whl=$(ssh $ssh_opts "$rw_user@$rw_host" "ls ${WHEEL_CACHE}/ctranslate2-*.whl 2>/dev/null | head -1" 2>/dev/null)
+    if [ -n "$cached_whl" ]; then
+        echo -e "  ${C_OK}[快取] 找到已編譯 wheel: $(basename "$cached_whl")${NC}"
+        if run_spinner "  安裝快取 wheel..." ssh $ssh_opts "$rw_user@$rw_host" "
+            ${REMOTE_PIP} install --disable-pip-version-check --force-reinstall '$cached_whl' 2>&1
+        "; then
+            echo ""
+            # 驗證
+            local ct2_cuda
+            ct2_cuda=$(ssh $ssh_opts "$rw_user@$rw_host" "LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH ${REMOTE_PY} -c \"
+import ctranslate2
+types = ctranslate2.get_supported_compute_types('cuda')
+print('ok' if types else 'no')
+\"" 2>/dev/null)
+            if [ "$ct2_cuda" = "ok" ]; then
+                check_ok "CTranslate2 CUDA 驗證通過（快取 wheel）"
+                # 重裝 faster-whisper 確保版本相容
+                ssh $ssh_opts "$rw_user@$rw_host" "${REMOTE_PIP} install --disable-pip-version-check --force-reinstall --no-deps faster-whisper" &>/dev/null
+                return 0
+            fi
+            echo -e "  ${C_WARN}[警告] 快取 wheel CUDA 驗證失敗，重新編譯${NC}"
+        else
+            echo ""
+            echo -e "  ${C_WARN}[警告] 快取 wheel 安裝失敗，重新編譯${NC}"
+        fi
+    fi
+
+    # ── 2. 檢查前提條件 ──
+    # nvcc（必要）— 檢查 PATH 和常見 CUDA 安裝路徑
+    local nvcc_path
+    nvcc_path=$(ssh $ssh_opts "$rw_user@$rw_host" "
+        if command -v nvcc &>/dev/null; then
+            command -v nvcc
+        elif [ -x /usr/local/cuda/bin/nvcc ]; then
+            echo /usr/local/cuda/bin/nvcc
+        elif ls /usr/local/cuda-*/bin/nvcc 2>/dev/null | head -1; then
+            true
+        else
+            echo ''
+        fi
+    " 2>/dev/null)
+    if [ -z "$nvcc_path" ]; then
+        echo -e "  ${C_WARN}[跳過] nvcc 未安裝（需要 CUDA Toolkit），無法編譯 CTranslate2${NC}"
+        return 1
+    fi
+    # 確保 nvcc 所在目錄加入 PATH（後續 cmake 需要）
+    local cuda_bin_dir
+    cuda_bin_dir=$(dirname "$nvcc_path")
+    echo -e "  ${C_DIM}  nvcc: ${nvcc_path}${NC}"
+
+    # 編譯所需工具與函式庫（一次檢查、一次安裝）
+    local need_build_apt=""
+    # cmake: 建構系統、git: 下載原始碼、g++: C++ 編譯器
+    # python3-dev: Python.h（bdist_wheel 需要）
+    # libopenblas-dev: aarch64 替代 Intel MKL 的 BLAS 函式庫
+    local build_tools="cmake git g++ make"
+    local build_libs="python3-dev libopenblas-dev"
+    for tool in $build_tools; do
+        if ! ssh $ssh_opts "$rw_user@$rw_host" "export PATH=${cuda_bin_dir}:\$PATH && command -v $tool" &>/dev/null; then
+            case "$tool" in
+                g++) need_build_apt="$need_build_apt g++ build-essential" ;;
+                *)   need_build_apt="$need_build_apt $tool" ;;
+            esac
+        fi
+    done
+    for pkg in $build_libs; do
+        if ! ssh $ssh_opts "$rw_user@$rw_host" "dpkg -s $pkg" &>/dev/null 2>&1; then
+            need_build_apt="$need_build_apt $pkg"
+        fi
+    done
+    if [ -n "$need_build_apt" ]; then
+        check_install "安裝編譯工具:${need_build_apt}"
+        if ! run_spinner "  安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "apt update -qq && apt install -y -qq $need_build_apt 2>&1"; then
+            echo ""
+            echo -e "    ${C_WARN}[跳過] 無法安裝編譯工具，無法編譯 CTranslate2${NC}"
+            return 1
+        fi
+        echo ""
+    fi
+    check_ok "編譯工具就緒"
+
+    # cuDNN（可選，影響效能但非必要）
+    local has_cudnn
+    has_cudnn=$(ssh $ssh_opts "$rw_user@$rw_host" "ldconfig -p 2>/dev/null | grep -c libcudnn" 2>/dev/null)
+    local cudnn_flag="OFF"
+    if [ "$has_cudnn" -gt 0 ] 2>/dev/null; then
+        cudnn_flag="ON"
+        echo -e "  ${C_DIM}  cuDNN 偵測到，將啟用 cuDNN 加速${NC}"
+    else
+        echo -e "  ${C_DIM}  cuDNN 未偵測到（可選，不影響編譯）${NC}"
+    fi
+
+    # 磁碟空間（需要 >= 3GB）
+    local avail_mb
+    avail_mb=$(ssh $ssh_opts "$rw_user@$rw_host" "df -m /tmp | awk 'NR==2{print \$4}'" 2>/dev/null)
+    if [ -n "$avail_mb" ] && [ "$avail_mb" -lt 3000 ] 2>/dev/null; then
+        echo -e "  ${C_WARN}[跳過] /tmp 磁碟空間不足（${avail_mb}MB < 3GB），無法編譯${NC}"
+        return 1
+    fi
+
+    # ── 3. 偵測 GPU 架構 ──
+    local gpu_arch
+    gpu_arch=$(ssh $ssh_opts "$rw_user@$rw_host" "nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '" 2>/dev/null)
+    if [ -z "$gpu_arch" ]; then
+        echo -e "  ${C_WARN}[跳過] 無法偵測 GPU 架構${NC}"
+        return 1
+    fi
+    echo -e "  ${C_DIM}  GPU 架構: sm_${gpu_arch//.}（compute capability ${gpu_arch}）${NC}"
+
+    # ── 4. 編譯（分步驟顯示進度）──
+    # gpu_arch="12.1" → cmake_arch="121"（移除小數點）
+    local cmake_arch="${gpu_arch//.}"
+    # 所有編譯步驟共用的環境變數前綴（確保 nvcc 在 PATH、libctranslate2 可被找到）
+    local CUDA_ENV="export PATH=${cuda_bin_dir}:\$PATH && export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH"
+    echo -e "  ${C_WHITE}  開始編譯 CTranslate2（預計 10-20 分鐘）...${NC}"
+
+    # 清理舊的暫存目錄
+    ssh $ssh_opts "$rw_user@$rw_host" "rm -rf ${BUILD_DIR} && mkdir -p ${BUILD_DIR}" &>/dev/null
+
+    # _build_fail: 統一的失敗處理（顯示錯誤 + 清理）
+    _build_fail() {
+        echo ""
+        echo -e "    ${C_WARN}[失敗] $1${NC}"
+        # 顯示最後幾行錯誤輸出幫助排查
+        if [ -f "$SPINNER_OUTPUT" ]; then
+            local err_lines
+            err_lines=$(grep -i -E 'error|fatal|fail|not found|no such' "$SPINNER_OUTPUT" 2>/dev/null | tail -5)
+            if [ -n "$err_lines" ]; then
+                echo -e "    ${C_DIM}錯誤訊息:${NC}"
+                echo "$err_lines" | while IFS= read -r line; do
+                    echo -e "    ${C_DIM}  $line${NC}"
+                done
+            fi
+        fi
+        ssh $ssh_opts "$rw_user@$rw_host" "rm -rf ${BUILD_DIR}" &>/dev/null
+    }
+
+    # 4a. git clone
+    if ! run_spinner "  [1/7] 下載 CTranslate2 原始碼..." ssh $ssh_opts "$rw_user@$rw_host" "
+        cd ${BUILD_DIR} && git clone --depth 1 --recurse-submodules https://github.com/OpenNMT/CTranslate2.git src 2>&1
+    "; then
+        _build_fail "git clone 失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4b. cmake
+    if ! run_spinner "  [2/7] cmake 設定（CUDA ${gpu_arch}, cuDNN=${cudnn_flag}）..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${CUDA_ENV} && \
+        mkdir -p ${BUILD_DIR}/src/build && cd ${BUILD_DIR}/src/build && \
+        cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_CUDA=ON \
+            -DWITH_CUDNN=${cudnn_flag} \
+            -DWITH_MKL=OFF \
+            -DWITH_OPENBLAS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=${cmake_arch} \
+            -DCUDA_NVCC_FLAGS='-gencode=arch=compute_${cmake_arch},code=sm_${cmake_arch}' \
+            -DOPENMP_RUNTIME=NONE \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            2>&1
+    "; then
+        _build_fail "cmake 設定失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4c. make（最耗時，使用全部 CPU 核心）
+    local ncpu
+    ncpu=$(ssh $ssh_opts "$rw_user@$rw_host" "nproc" 2>/dev/null)
+    ncpu=${ncpu:-4}
+    if ! run_spinner "  [3/7] 編譯 C++ 原始碼（make -j${ncpu}，此步驟最久）..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${CUDA_ENV} && \
+        cd ${BUILD_DIR}/src/build && make -j${ncpu} 2>&1
+    "; then
+        _build_fail "make 編譯失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4d. make install + ldconfig
+    if ! run_spinner "  [4/7] 安裝系統函式庫（make install + ldconfig）..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${CUDA_ENV} && \
+        cd ${BUILD_DIR}/src/build && make install 2>&1 && ldconfig 2>&1
+    "; then
+        _build_fail "make install 失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4e. Python wheel
+    if ! run_spinner "  [5/7] 建構 Python wheel..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${CUDA_ENV} && \
+        cd ${BUILD_DIR}/src/python && \
+        ${REMOTE_PIP} install --disable-pip-version-check setuptools wheel pybind11 2>&1 && \
+        ${REMOTE_PY} setup.py bdist_wheel 2>&1
+    "; then
+        _build_fail "Python wheel 建構失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4f. pip install wheel
+    if ! run_spinner "  [6/7] 安裝 CTranslate2 wheel..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${CUDA_ENV} && \
+        whl=\$(ls ${BUILD_DIR}/src/python/dist/ctranslate2-*.whl 2>/dev/null | head -1)
+        if [ -z \"\$whl\" ]; then
+            echo 'ERROR: wheel 未產生'
+            exit 1
+        fi
+        ${REMOTE_PIP} install --disable-pip-version-check --force-reinstall \"\$whl\" 2>&1
+    "; then
+        _build_fail "wheel 安裝失敗"
+        return 1
+    fi
+    echo ""
+
+    # 4g. 快取 wheel + 清理
+    run_spinner "  [7/7] 快取 wheel 並清理暫存檔..." ssh $ssh_opts "$rw_user@$rw_host" "
+        mkdir -p ${WHEEL_CACHE}
+        cp ${BUILD_DIR}/src/python/dist/ctranslate2-*.whl ${WHEEL_CACHE}/ 2>&1
+        rm -rf ${BUILD_DIR}
+    "
+    echo ""
+
+    # ── 5. 驗證 CTranslate2 CUDA ──
+    local ct2_verify
+    ct2_verify=$(ssh $ssh_opts "$rw_user@$rw_host" "${CUDA_ENV} && ${REMOTE_PY} -c \"
+import ctranslate2
+types = ctranslate2.get_supported_compute_types('cuda')
+print(','.join(types) if types else 'no')
+\"" 2>/dev/null)
+    if [ "$ct2_verify" = "no" ] || [ -z "$ct2_verify" ]; then
+        echo -e "  ${C_WARN}[失敗] CTranslate2 編譯完成但 CUDA 驗證失敗${NC}"
+        return 1
+    fi
+    check_ok "CTranslate2 CUDA 支援: ${ct2_verify}"
+
+    # ── 6. 確認 libctranslate2.so 已註冊 ──
+    local lib_check
+    lib_check=$(ssh $ssh_opts "$rw_user@$rw_host" "ldconfig -p 2>/dev/null | grep -c libctranslate2" 2>/dev/null)
+    if [ "$lib_check" -gt 0 ] 2>/dev/null; then
+        check_ok "libctranslate2.so 已註冊（ldconfig）"
+    else
+        echo -e "  ${C_DIM}  libctranslate2.so 未在 ldconfig 中（透過 LD_LIBRARY_PATH 載入）${NC}"
+    fi
+
+    # ── 7. 重裝 faster-whisper + 驗證 CUDA 載入 ──
+    run_spinner "  重新安裝 faster-whisper..." ssh $ssh_opts "$rw_user@$rw_host" "
+        ${REMOTE_PIP} install --disable-pip-version-check --force-reinstall --no-deps faster-whisper 2>&1
+    "
+    echo ""
+
+    local fw_verify
+    fw_verify=$(ssh $ssh_opts "$rw_user@$rw_host" "${CUDA_ENV} && ${REMOTE_PY} -c \"
+from faster_whisper import WhisperModel
+m = WhisperModel('tiny', device='cuda', compute_type='float16')
+print('ok')
+\"" 2>/dev/null)
+    if [ "$fw_verify" = "ok" ]; then
+        check_ok "faster-whisper CUDA 載入驗證通過"
+    else
+        echo -e "  ${C_WARN}[警告] faster-whisper 無法以 CUDA 載入模型${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
 # ─── 遠端 GPU Whisper 伺服器（選填）──────────────
 setup_remote_whisper() {
     section "遠端 GPU 語音辨識伺服器（非必要，若未裝則用本機進行語音辨識）"
 
+    # 使用 venv Python 讀寫 config（避免依賴系統 python3）
+    local _PY="$VENV_DIR/bin/python3"
+
     # 檢查是否已有設定
     local existing_host existing_port existing_user existing_key existing_wport
-    existing_host=$(python3 -c "
+    existing_host=$("$_PY" -c "
 import json, os
 p = '$SCRIPT_DIR/config.json'
 if os.path.isfile(p):
@@ -650,10 +1042,10 @@ if os.path.isfile(p):
 
     if [ -n "$existing_host" ]; then
         # 已有設定，讀取完整資訊
-        existing_port=$(python3 -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_port',22))" 2>/dev/null)
-        existing_user=$(python3 -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_user','root'))" 2>/dev/null)
-        existing_key=$(python3 -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_key',''))" 2>/dev/null)
-        existing_wport=$(python3 -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('whisper_port',8978))" 2>/dev/null)
+        existing_port=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_port',22))" 2>/dev/null)
+        existing_user=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_user','root'))" 2>/dev/null)
+        existing_key=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_key',''))" 2>/dev/null)
+        existing_wport=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('whisper_port',8978))" 2>/dev/null)
 
         echo -e "  ${C_WHITE}已有遠端設定: ${existing_user}@${existing_host}:${existing_port}${NC}"
 
@@ -731,7 +1123,7 @@ if os.path.isfile(p):
                 gpu_info=$(ssh $chk_opts "$existing_user@$existing_host" "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)
                 if [ -n "$gpu_info" ]; then
                     check_ok "NVIDIA GPU: ${gpu_info}"
-                    cuda_check=$(ssh $chk_opts "$existing_user@$existing_host" "~/jt-whisper-server/venv/bin/python3 -c \"
+                    cuda_check=$(ssh $chk_opts "$existing_user@$existing_host" "LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH ~/jt-whisper-server/venv/bin/python3 -c \"
 import torch
 pt = torch.cuda.is_available()
 ct2 = False
@@ -750,9 +1142,26 @@ print(f'{pt},{ct2},{ow}')
                     ct2_ok=$(echo "$cuda_check" | cut -d, -f2)
                     ow_ok=$(echo "$cuda_check" | cut -d, -f3)
                     if [ "$pt_ok" = "True" ] && [ "$ct2_ok" = "True" ]; then
-                        check_ok "CUDA 可用（faster-whisper + CTranslate2）"
+                        # 區分原始碼編譯 vs PyPI 預編譯
+                        local ct2_src=""
+                        if ssh $chk_opts "$existing_user@$existing_host" "ls ~/jt-whisper-server/.ct2-wheels/ctranslate2-*.whl" &>/dev/null 2>&1; then
+                            ct2_src="原始碼編譯"
+                        fi
+                        if [ -n "$ct2_src" ]; then
+                            check_ok "CUDA 可用（faster-whisper + CTranslate2 ${ct2_src}）"
+                        else
+                            check_ok "CUDA 可用（faster-whisper + CTranslate2）"
+                        fi
                     elif [ "$pt_ok" = "True" ] && [ "$ow_ok" = "True" ]; then
-                        check_ok "CUDA 可用（openai-whisper + PyTorch）"
+                        # 檢查是否為 aarch64（spinner 結束後再觸發編譯）
+                        local chk_arch
+                        chk_arch=$(ssh $chk_opts "$existing_user@$existing_host" "uname -m" 2>/dev/null)
+                        if [ "$chk_arch" = "aarch64" ]; then
+                            echo -e "  ${C_WARN}[提醒]${NC} aarch64 + openai-whisper（較慢），稍後嘗試編譯 CTranslate2"
+                            need_repair=2  # 特殊值：不是故障，而是可升級
+                        else
+                            check_ok "CUDA 可用（openai-whisper + PyTorch）"
+                        fi
                     else
                         if [ "$pt_ok" != "True" ]; then
                             echo -e "  ${C_WARN}[警告]${NC} 有 GPU 但 PyTorch CUDA 不可用 — 需修復"
@@ -765,6 +1174,19 @@ print(f'{pt},{ct2},{ow}')
                 else
                     echo -e "  ${C_DIM}未偵測到 NVIDIA GPU（將以 CPU 辨識）${NC}"
                 fi
+
+                # 7. 遠端磁碟空間（非阻斷，僅提示）
+                local remote_avail_mb
+                remote_avail_mb=$(ssh $chk_opts "$existing_user@$existing_host" "df -m ~ | awk 'NR==2{print \$4}'" 2>/dev/null)
+                if [ -n "$remote_avail_mb" ] && [ "$remote_avail_mb" -gt 0 ] 2>/dev/null; then
+                    local remote_avail_gb
+                    remote_avail_gb=$(awk "BEGIN{printf \"%.1f\", $remote_avail_mb/1024}")
+                    if [ "$remote_avail_mb" -lt 5000 ]; then
+                        echo -e "  ${C_WARN}[警告]${NC} 遠端磁碟空間偏低（${remote_avail_gb} GB 可用）"
+                    else
+                        check_ok "遠端磁碟空間 ${remote_avail_gb} GB 可用"
+                    fi
+                fi
             else
                 check_fail "SSH 連線失敗"
                 need_repair=1
@@ -773,6 +1195,17 @@ print(f'{pt},{ct2},{ow}')
         } > "$_CHECK_BUF" 2>&1
         spinner_stop
         cat "$_CHECK_BUF"
+
+        # aarch64 CTranslate2 原始碼編譯（need_repair=2 表示可升級）
+        if [ "$need_repair" -eq 2 ]; then
+            if _build_ctranslate2_from_source "$chk_opts" "$existing_user" "$existing_host"; then
+                check_ok "CUDA 已升級（faster-whisper + CTranslate2 原始碼編譯）"
+            else
+                echo -e "  ${C_WARN}[提醒]${NC} CTranslate2 原始碼編譯失敗，faster-whisper 無法使用 CUDA GPU"
+                check_ok "CUDA 可用（降級使用 openai-whisper + PyTorch，速度較慢約 ~2x realtime）"
+            fi
+            need_repair=0
+        fi
 
         if [ "$need_repair" -eq 0 ]; then
             # 確認 SSH 免密碼登入（ControlMaster 仍在，不會再問密碼）
@@ -796,7 +1229,7 @@ except: print('no')
 \"" 2>/dev/null)
             # 預下載所有辨識模型
             ssh $chk_opts "$existing_user@$existing_host" "
-                ~/jt-whisper-server/venv/bin/python3 -c \"
+                LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH ~/jt-whisper-server/venv/bin/python3 -c \"
 import sys
 # 偵測後端
 use_openai = False
@@ -824,10 +1257,14 @@ if use_openai:
         except Exception as e:
             print(f'  {m}: 下載失敗 ({e})', flush=True)
 else:
+    import os, logging
+    os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
+    os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+    logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
     from faster_whisper import WhisperModel
     for m in models:
         try:
-            WhisperModel(m, device='cpu', compute_type='int8')
+            WhisperModel(m, device='cpu', compute_type='float32')
             print(f'  {m}: 已就緒', flush=True)
         except Exception as e:
             print(f'  {m}: 下載失敗 ({e})', flush=True)
@@ -846,7 +1283,9 @@ else:
             if [ "$local_hash" != "$remote_hash" ]; then
                 scp $scp_chk_opts "$SCRIPT_DIR/remote_whisper_server.py" "$existing_user@$existing_host:~/jt-whisper-server/server.py" &>/dev/null
                 if [ $? -eq 0 ]; then
-                    check_ok "server.py 已同步更新"
+                    # 重啟遠端伺服器以載入新版程式
+                    ssh $chk_opts "$existing_user@$existing_host" "pkill -f 'server.py --port' 2>/dev/null" &>/dev/null || true
+                    check_ok "server.py 已同步更新（已重啟遠端伺服器，執行程式時自動載入新版）"
                 fi
             fi
             # 關閉 SSH 多工
@@ -975,7 +1414,7 @@ else:
     # soundfile: 需要 libsndfile（resemblyzer → librosa → soundfile）
     # cffi: 需要 libffi（soundfile → cffi）
     # pkg-config: 用於偵測系統函式庫
-    local build_pkgs="build-essential python3-dev pkg-config libffi-dev libsndfile1-dev"
+    local build_pkgs="build-essential python3-dev pkg-config libffi-dev libsndfile1-dev cmake git"
     for pkg in $build_pkgs; do
         if ! ssh $ssh_opts "$rw_user@$rw_host" "dpkg -s $pkg" &>/dev/null 2>&1; then
             need_apt="$need_apt $pkg"
@@ -992,6 +1431,24 @@ else:
         echo ""
     fi
     check_ok "Python3 + ffmpeg + 編譯工具就緒"
+
+    # 檢查遠端磁碟空間
+    local remote_avail_mb
+    remote_avail_mb=$(ssh $ssh_opts "$rw_user@$rw_host" "df -m ~ | awk 'NR==2{print \$4}'" 2>/dev/null)
+    if [ -n "$remote_avail_mb" ] && [ "$remote_avail_mb" -gt 0 ] 2>/dev/null; then
+        local remote_avail_gb
+        remote_avail_gb=$(awk "BEGIN{printf \"%.1f\", $remote_avail_mb/1024}")
+        if [ "$remote_avail_mb" -lt 5000 ]; then
+            check_fail "遠端磁碟空間不足：可用 ${remote_avail_gb} GB，最小需要 5 GB"
+            echo -e "  ${C_DIM}遠端 GPU 伺服器需要安裝 PyTorch (~2.5GB) + Whisper 模型 (~6GB)${NC}"
+            _cleanup_ssh_cm
+            return 1
+        elif [ "$remote_avail_mb" -lt 12000 ]; then
+            echo -e "  ${C_WARN}[注意]${NC} 遠端可用空間 ${remote_avail_gb} GB（完整安裝需 12 GB）"
+        else
+            check_ok "遠端磁碟空間充足（${remote_avail_gb} GB 可用）"
+        fi
+    fi
 
     # 檢查遠端 NVIDIA GPU + CUDA
     local remote_gpu_name
@@ -1062,21 +1519,34 @@ else:
         check_ok "PyTorch 安裝完成"
     fi
 
-    # 安裝其他套件（ctranslate2 需要 force-reinstall 以確保 CUDA 版）
+    # 安裝其他套件
     check_install "安裝遠端 Python 套件..."
-    local fw_extra=""
-    if [ -n "$torch_index" ]; then
-        fw_extra="--force-reinstall"
-    fi
+    # 檢查是否有原始碼編譯的 CTranslate2 快取 wheel（aarch64 CUDA）
+    local ct2_cached_whl=""
+    ct2_cached_whl=$(ssh $ssh_opts "$rw_user@$rw_host" "ls ~/jt-whisper-server/.ct2-wheels/ctranslate2-*.whl 2>/dev/null | head -1" 2>/dev/null)
     # setuptools<81: 保留 pkg_resources（webrtcvad 等舊套件需要，setuptools 82+ 已移除）
-    # 必須放在同一行，否則 --force-reinstall 會把 setuptools 升回最新版
     # 依賴鏈: resemblyzer → webrtcvad(需gcc+Python.h+pkg_resources) + librosa → soundfile(需libsndfile+libffi)
-    run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "
-        PIP=~/jt-whisper-server/venv/bin/pip
-        \$PIP install --disable-pip-version-check 'setuptools<81' wheel 2>&1
-        \$PIP install --disable-pip-version-check $fw_extra \
-            'setuptools<81' ctranslate2 faster-whisper fastapi uvicorn python-multipart resemblyzer spectralcluster 2>&1
-    "
+    if [ -n "$ct2_cached_whl" ]; then
+        # 有原始碼編譯 wheel：跳過 PyPI 的 ctranslate2，用快取 wheel + --no-deps 保護
+        run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "
+            PIP=~/jt-whisper-server/venv/bin/pip
+            \$PIP install --disable-pip-version-check 'setuptools<81' wheel 2>&1
+            \$PIP install --disable-pip-version-check --force-reinstall --no-deps '$ct2_cached_whl' 2>&1
+            \$PIP install --disable-pip-version-check \
+                'setuptools<81' faster-whisper fastapi uvicorn python-multipart resemblyzer spectralcluster 2>&1
+        "
+    else
+        local fw_extra=""
+        if [ -n "$torch_index" ]; then
+            fw_extra="--force-reinstall"
+        fi
+        run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "
+            PIP=~/jt-whisper-server/venv/bin/pip
+            \$PIP install --disable-pip-version-check 'setuptools<81' wheel 2>&1
+            \$PIP install --disable-pip-version-check $fw_extra \
+                'setuptools<81' ctranslate2 faster-whisper fastapi uvicorn python-multipart resemblyzer spectralcluster 2>&1
+        "
+    fi
     if [ $? -ne 0 ]; then
         echo ""
         check_fail "遠端套件安裝失敗"
@@ -1089,7 +1559,7 @@ else:
     # 驗證 CUDA（PyTorch + CTranslate2）
     if [ -n "$torch_index" ]; then
         local cuda_check
-        cuda_check=$(ssh $ssh_opts "$rw_user@$rw_host" "~/jt-whisper-server/venv/bin/python3 -c \"
+        cuda_check=$(ssh $ssh_opts "$rw_user@$rw_host" "LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH ~/jt-whisper-server/venv/bin/python3 -c \"
 import torch
 pt = torch.cuda.is_available()
 try:
@@ -1104,19 +1574,31 @@ print(f'{pt},{ct2}')
         if [ "$pt_ok" = "True" ] && [ "$ct2_ok" = "True" ]; then
             check_ok "CUDA 驗證通過（faster-whisper + CTranslate2 CUDA）"
         elif [ "$pt_ok" = "True" ]; then
-            check_install "CTranslate2 無 CUDA，改裝 openai-whisper（PyTorch CUDA）..."
-            run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "
-                PIP=~/jt-whisper-server/venv/bin/pip
-                \$PIP install --disable-pip-version-check 'setuptools<81' openai-whisper 2>&1
-            "
-            echo ""
-            # 驗證 openai-whisper
-            local ow_ok
-            ow_ok=$(ssh $ssh_opts "$rw_user@$rw_host" "~/jt-whisper-server/venv/bin/python3 -c 'import whisper; print(\"ok\")'" 2>/dev/null)
-            if [ "$ow_ok" = "ok" ]; then
-                check_ok "CUDA 驗證通過（openai-whisper + PyTorch CUDA）"
-            else
-                echo -e "  ${C_WARN}[警告]${NC} openai-whisper 安裝失敗，Whisper 將以 CPU 執行"
+            # 偵測架構：aarch64 嘗試原始碼編譯 CTranslate2
+            local remote_arch
+            remote_arch=$(ssh $ssh_opts "$rw_user@$rw_host" "uname -m" 2>/dev/null)
+            local ct2_built=0
+            if [ "$remote_arch" = "aarch64" ]; then
+                if _build_ctranslate2_from_source "$ssh_opts" "$rw_user" "$rw_host"; then
+                    ct2_built=1
+                    check_ok "CUDA 驗證通過（faster-whisper + CTranslate2 原始碼編譯）"
+                fi
+            fi
+            if [ "$ct2_built" -eq 0 ]; then
+                check_install "CTranslate2 無 CUDA，改裝 openai-whisper（PyTorch CUDA）..."
+                run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "
+                    PIP=~/jt-whisper-server/venv/bin/pip
+                    \$PIP install --disable-pip-version-check 'setuptools<81' openai-whisper 2>&1
+                "
+                echo ""
+                # 驗證 openai-whisper
+                local ow_ok
+                ow_ok=$(ssh $ssh_opts "$rw_user@$rw_host" "~/jt-whisper-server/venv/bin/python3 -c 'import whisper; print(\"ok\")'" 2>/dev/null)
+                if [ "$ow_ok" = "ok" ]; then
+                    check_ok "CUDA 驗證通過（openai-whisper + PyTorch CUDA）"
+                else
+                    echo -e "  ${C_WARN}[警告]${NC} openai-whisper 安裝失敗，Whisper 將以 CPU 執行"
+                fi
             fi
         else
             echo -e "  ${C_WARN}[警告]${NC} PyTorch CUDA 無法使用，Whisper 將以 CPU 執行"
@@ -1139,6 +1621,7 @@ print(f'{pt},{ct2}')
     # 測試啟動
     ssh $ssh_opts "$rw_user@$rw_host" "
         cd ~/jt-whisper-server
+        export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH
         nohup venv/bin/python3 server.py --port $rw_port > /tmp/jt-whisper-server.log 2>&1 &
         echo \$!
     " > /tmp/rw_pid.txt 2>/dev/null
@@ -1203,10 +1686,14 @@ if use_openai:
         except Exception as e:
             print(f'  {m}: 下載失敗 ({e})', flush=True)
 else:
+    import os, logging
+    os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
+    os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+    logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
     from faster_whisper import WhisperModel
     for m in models:
         try:
-            WhisperModel(m, device='cpu', compute_type='int8')
+            WhisperModel(m, device='cpu', compute_type='float32')
             print(f'  {m}: 已就緒', flush=True)
         except Exception as e:
             print(f'  {m}: 下載失敗 ({e})', flush=True)
@@ -1218,7 +1705,7 @@ else:
     _cleanup_ssh_cm
 
     # 寫入 config.json（merge 進現有設定）
-    python3 -c "
+    "$_PY" -c "
 import json, os
 config_path = '$SCRIPT_DIR/config.json'
 cfg = {}
@@ -1265,6 +1752,43 @@ print_summary() {
     fi
 }
 
+# ─── 磁碟空間檢查 ────────────────────────────────
+check_disk_space() {
+    section "磁碟空間檢查"
+
+    # 取得安裝目錄可用空間（MB）
+    local avail_mb
+    avail_mb=$(df -m "$SCRIPT_DIR" | awk 'NR==2{print $4}')
+    local avail_gb
+    avail_gb=$(awk "BEGIN{printf \"%.1f\", $avail_mb/1024}")
+
+    # 最小需求 3 GB，推薦 8 GB，完整 14 GB
+    if [ "$avail_mb" -lt 3000 ]; then
+        check_fail "磁碟空間不足：可用 ${avail_gb} GB，最小需要 3 GB"
+        echo -e "  ${C_DIM}請釋放磁碟空間後再執行安裝${NC}"
+        return 1
+    elif [ "$avail_mb" -lt 8000 ]; then
+        echo -e "  ${C_WARN}[注意]${NC} 可用空間 ${avail_gb} GB（推薦 8 GB 以上，完整安裝需 14 GB）"
+        echo -e "  ${C_DIM}基本功能可正常安裝，但離線處理模型快取需更多空間${NC}"
+    else
+        check_ok "磁碟空間充足（${avail_gb} GB 可用）"
+    fi
+
+    # 檢查 ~/.cache 所在分割區（HuggingFace 快取約 5.3 GB）
+    local home_dev script_dev
+    script_dev=$(df "$SCRIPT_DIR" | awk 'NR==2{print $1}')
+    home_dev=$(df "$HOME" | awk 'NR==2{print $1}')
+    if [ "$script_dev" != "$home_dev" ]; then
+        local home_avail_mb
+        home_avail_mb=$(df -m "$HOME" | awk 'NR==2{print $4}')
+        local home_avail_gb
+        home_avail_gb=$(awk "BEGIN{printf \"%.1f\", $home_avail_mb/1024}")
+        if [ "$home_avail_mb" -lt 6000 ]; then
+            echo -e "  ${C_WARN}[注意]${NC} 家目錄可用空間 ${home_avail_gb} GB（~/.cache/huggingface/ 模型快取需約 5-6 GB）"
+        fi
+    fi
+}
+
 # ─── 主流程 ──────────────────────────────────────
 print_title
 
@@ -1274,6 +1798,11 @@ if [ "$1" = "--upgrade" ]; then
     exit $?
 fi
 
+check_macos_version || exit 1
+check_xcode_clt || exit 1
+check_internet || exit 1
+check_running_processes || exit 1
+check_disk_space || exit 1
 check_homebrew || exit 1
 check_brew_deps
 check_python || exit 1

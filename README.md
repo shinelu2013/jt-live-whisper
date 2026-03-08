@@ -1,4 +1,4 @@
-# jt-live-whisper v1.9.4
+# jt-live-whisper v2.0.9
 
 **100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、講者辨識、會議摘要，所有 AI 模型皆在自有設備上運行，資料不經過任何雲端服務。
 
@@ -32,6 +32,8 @@ Author: Jason Cheng (Jason Tools)
 
 所有模型皆在自有設備上推論（本機或區域網路內的 GPU 伺服器），**不需要任何第三方雲端 API**。
 
+> **為什麼講者辨識不用 pyannote.audio？** pyannote 的預訓練模型授權限制了可使用的用途與場景，且需要在 HuggingFace 註冊帳號、申請存取權限並設定 Token 才能下載模型。這不符合本工具「零帳號、零註冊、完全地端」的設計理念。resemblyzer + spectralcluster 完全開源、安裝即用、無需任何帳號或 Token。
+
 ## 兩種部署方式
 
 - **單機模式**： 一台 MacBook / Mac mini 即可完成所有處理。語音辨識（Whisper/Moonshine）、翻譯（LLM/Argos）全部在本機 CPU 執行，不需要額外硬體。適合個人使用、外出攜帶。
@@ -54,10 +56,16 @@ Author: Jason Cheng (Jason Tools)
 
 ![離線處理選單：模式與模型選擇](images/offline-menu-1.png)
 
+![離線處理選單：LLM 伺服器與講者辨識](images/offline-menu-2.png)
+
+![離線處理選單：設定總覽與等效 CLI 指令](images/offline-menu-3.png)
+
 ### 3. AI 講者辨識（Speaker Diarization）
 自動辨識音訊中的不同講者，以不同顏色標示，支援自動偵測或手動指定講者人數。
 
 ![講者辨識：不同講者以不同顏色顯示](images/offline-diarize-result.png)
+
+![講者辨識：終端機逐字稿輸出](images/offline-diarize-result-2.png)
 
 ### 4. AI 會議摘要
 批次對記錄檔生成摘要，透過本地端 LLM 產出重點整理 + 校正逐字稿。搭配講者辨識，摘要中不同講者以不同顏色區分。
@@ -65,6 +73,8 @@ Author: Jason Cheng (Jason Tools)
 ![AI 會議摘要產出畫面](images/summary-output.png)
 
 ![匯入錄音檔產生的摘要與校正逐字稿](images/offline-summary-diarize.png)
+
+![時間逐字稿 HTML](images/offline-transcript.png)
 
 ### 5. 多模式語音轉錄
 4 種功能模式：英翻中 / 中翻英 / 純英文轉錄 / 純中文轉錄，滿足各種使用場景。
@@ -85,6 +95,36 @@ Author: Jason Cheng (Jason Tools)
 - [BlackHole 2ch](https://existential.audio/blackhole/)（虛擬音訊驅動，安裝腳本會自動安裝）
 - 本地端 LLM 伺服器（推薦 [Ollama](https://ollama.com/)，翻譯/摘要用。推薦搭配 [NVIDIA DGX Spark](https://www.nvidia.com/zh-tw/products/workstations/dgx-spark/) 運行 Ollama，CP 值高。**沒有 LLM 伺服器也能用**：程式可切換為純本機 Argos 離線翻譯引擎，完全不需額外伺服器，但摘要功能需要 LLM）
 
+### 磁碟空間需求
+
+安裝腳本會在安裝前自動檢查可用空間是否足夠。
+
+#### 本機 Mac
+
+| 元件 | 大小 | 說明 |
+|------|------|------|
+| Python venv + 套件 | ~1.1 GB | ctranslate2, faster-whisper, resemblyzer, spectralcluster 等 |
+| whisper.cpp 原始碼 + 編譯 | ~60 MB | git repo + build |
+| Whisper GGML 模型 | 1.5~6.4 GB | 預設 large-v3-turbo (1.5GB)；全部 5 個模型共 6.4 GB |
+| Moonshine 模型 | ~245 MB | 英文即時辨識（選用） |
+| Argos 翻譯模型 | ~83 MB | 離線備援翻譯 |
+| Homebrew 套件 | ~140 MB | cmake + sdl2 + ffmpeg |
+| HuggingFace 快取 | ~5.3 GB | `~/.cache/huggingface/`，`--input` 離線處理用，首次使用時下載 |
+| **最小安裝** | **~3 GB** | venv + 1 個 Whisper 模型 + 基本套件 |
+| **推薦安裝** | **~8 GB** | 加上 HuggingFace 快取（離線處理音訊檔用） |
+| **完整安裝** | **~14 GB** | 全部 Whisper 模型 + HuggingFace 快取 + Moonshine |
+
+#### 遠端 GPU 伺服器（選配）
+
+| 元件 | 大小 | 說明 |
+|------|------|------|
+| PyTorch GPU (CUDA) | ~2.5 GB | 依 CUDA 版本而異 |
+| Python venv + 套件 | ~1 GB | faster-whisper, fastapi, resemblyzer 等 |
+| Whisper 模型 | ~6 GB | 5 個模型（CTranslate2 格式），首次安裝時下載 |
+| openai-whisper | ~500 MB | CTranslate2 CUDA 不可用時才安裝 |
+| **最小安裝** | **~5 GB** | PyTorch + 1 個模型 |
+| **完整安裝** | **~12 GB** | PyTorch + 全部 5 個模型 + 講者辨識套件 |
+
 ## 快速開始
 
 ### 1. 一鍵安裝
@@ -102,7 +142,7 @@ git clone https://github.com/jasoncheng7115/jt-live-whisper.git
 cd jt-live-whisper && ./install.sh
 ```
 
-安裝腳本會自動下載並設定所有地端 AI 模型和相依套件（Whisper 語音辨識模型、Moonshine 串流辨識模型、Argos 離線翻譯模型、whisper.cpp 編譯等）。
+安裝腳本會自動下載並設定所有地端 AI 模型和相依套件（Whisper 語音辨識模型、Moonshine 串流辨識模型、Argos 離線翻譯模型、whisper.cpp 編譯等）。安裝最後會詢問是否設定遠端 GPU 語音辨識伺服器（選填），若有 NVIDIA GPU 伺服器（如 DGX Spark / Ubuntu + CUDA），可透過 SSH 自動在遠端安裝 PyTorch、faster-whisper 等套件，大幅加速語音辨識。
 
 > 首次安裝預估時間：約 10~20 分鐘（視網路速度而定，主要是下載 AI 模型和編譯 whisper.cpp）
 
@@ -119,6 +159,8 @@ cd jt-live-whisper && ./install.sh
 3. 勾選你的喇叭/耳機 + BlackHole 2ch
 4. **主裝置選 BlackHole 2ch**（虛擬裝置時脈穩定，不會因藍牙斷線而失效）
 5. 到「系統設定 → 聲音 → 輸出」，選擇此多重輸出裝置
+
+![macOS 音訊 MIDI 設定：多重輸出裝置](images/audio-midi-setup.png)
 
 ```
 對方說話 → Zoom/Teams 輸出 → 多重輸出裝置 → 耳機（你聽到）
@@ -197,7 +239,7 @@ ollama pull qwen2.5:14b
 ### 批次摘要
 
 ```bash
-./start.sh --summarize logs/en2zh_translation_20260101_120000.txt
+./start.sh --summarize logs/英翻中_逐字稿_20260101_120000.txt
 ```
 
 ### 快捷鍵（即時模式）
@@ -215,7 +257,7 @@ ollama pull qwen2.5:14b
 | `-m`, `--model MODEL` | Whisper 模型 | large-v3-turbo |
 | `--engine ENGINE` | 翻譯引擎 (llm / argos，llm 支援 Ollama 及 OpenAI 相容伺服器) | llm |
 | `--llm-model MODEL` | LLM 翻譯模型 | qwen2.5:14b |
-| `--llm-host HOST` | LLM 伺服器位址 | 192.168.1.40:11434 |
+| `--llm-host HOST` | LLM 伺服器位址 | 無（需設定） |
 | `--topic TOPIC` | 會議主題（提升翻譯品質） | |
 | `--summary-model MODEL` | 摘要用 LLM 模型 | qwen2.5:14b |
 | `--input FILE` | 離線處理音訊檔 | |
