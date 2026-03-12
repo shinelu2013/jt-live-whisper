@@ -2,7 +2,7 @@
 
 **100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、講者辨識、會議摘要，所有 AI 模型皆在自有設備上執行，資料不經過任何雲端服務。
 
-核心功能涵蓋即時語音轉錄、中日英即時翻譯字幕、離線音訊檔批次處理、AI 講者辨識（Speaker Diarization）、以及 LLM 會議摘要產出。採用系統音訊裝置層級擷取（macOS 使用 BlackHole，Windows 使用 WASAPI Loopback），**理論上任何軟體的聲音輸出都能即時處理**：視訊會議（Zoom、Teams、Meet）、YouTube、Podcast、串流影片等，不限定特定應用程式。所有 AI 推論皆由地端模型完成，全程不經過第三方雲端 API。
+核心功能涵蓋即時語音轉錄、中日英即時翻譯字幕、離線音訊檔批次處理、講者辨識（Speaker Diarization）、以及 LLM 會議摘要產出。採用系統音訊裝置層級擷取（macOS 使用 BlackHole，Windows 使用 WASAPI Loopback），**理論上任何軟體的聲音輸出都能即時處理**：視訊會議（Zoom、Teams、Meet）、YouTube、Podcast、串流影片等，不限定特定應用程式。所有 AI 推論皆由地端模型完成，全程不經過第三方雲端 API。
 
 Author: Jason Cheng (Jason Tools)
 
@@ -63,7 +63,7 @@ Author: Jason Cheng (Jason Tools)
 
 ![離線處理選單：設定總覽與等效 CLI 指令](images/offline-menu-3.png)
 
-### 3. AI 講者辨識（Speaker Diarization）
+### 3. 講者辨識（Speaker Diarization）
 自動辨識音訊中的不同講者，以不同顏色標示，支援自動偵測或手動指定講者人數。
 
 ![講者辨識：不同講者以不同顏色顯示](images/offline-diarize-result.png)
@@ -293,7 +293,7 @@ cd C:\jt-live-whisper
 # 英翻中 + 自動摘要
 ./start.sh --input meeting.mp3 --summarize
 
-# AI 講者辨識
+# 講者辨識
 ./start.sh --input meeting.mp3 --diarize
 
 # 指定講者人數 + 摘要
@@ -325,7 +325,7 @@ cd C:\jt-live-whisper
 | `--topic TOPIC` | 會議主題（提升翻譯品質） | |
 | `--summary-model MODEL` | 摘要用 LLM 模型 | gpt-oss:120b |
 | `--input FILE` | 離線處理音訊檔 | |
-| `--diarize` | 啟用 AI 講者辨識 | |
+| `--diarize` | 啟用講者辨識 | |
 | `--num-speakers N` | 指定講者人數 | 自動偵測 |
 | `--summarize [FILE ...]` | 生成 AI 摘要 | |
 
@@ -371,7 +371,7 @@ jt-live-whisper/
   音訊檔（mp3/wav/m4a/flac）
     → ffmpeg 轉檔
       → 本地端 faster-whisper AI 語音辨識
-        → （選配）AI 講者辨識
+        → （選配）講者辨識
           → 本地端 LLM / NLLB / Argos 翻譯 + AI 摘要
 ```
 
@@ -392,6 +392,8 @@ jt-live-whisper/
 ## >>> [完整使用手冊（SOP.md）](SOP.md) <<<
 
 包含完整安裝教學、macOS / Windows 音訊設定說明、所有功能模式詳細說明、互動式選單操作、講者辨識設定、摘要功能用法、進階 CLI 參數、FAQ 等。
+
+## >>> [版本記錄（CHANGELOG.md）](CHANGELOG.md) <<<
 
 ---
 
