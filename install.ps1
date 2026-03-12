@@ -252,7 +252,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.7.0 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.7.1 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
 Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
@@ -266,22 +266,29 @@ Write-Host ""
 if ($Upgrade) {
     section "從 GitHub 升級程式"
 
-    if (-not (cmd_exists "git")) {
-        check_fail "找不到 git，請先安裝：winget install Git.Git"
-        exit 1
-    }
-
     $tmpDir = Join-Path $env:TEMP "jt-upgrade-$(Get-Random)"
+    $zipPath = Join-Path $tmpDir "jt-live-whisper.zip"
+    New-Item -Path $tmpDir -ItemType Directory -Force | Out-Null
     info "正在從 GitHub 下載最新版本..."
-    & git clone --depth 1 $GITHUB_REPO "$tmpDir\repo" 2>$null
-
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$tmpDir\repo\translate_meeting.py")) {
+    $oldProg = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try {
+        Invoke-WebRequest -Uri $GITHUB_ZIP -OutFile $zipPath -UseBasicParsing
+    } catch {
         check_fail "無法連接 GitHub，請檢查網路連線"
         Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         exit 1
     }
+    $ProgressPreference = $oldProg
+    Expand-Archive $zipPath -DestinationPath $tmpDir -Force
+    $repoDir = (Get-ChildItem $tmpDir -Directory | Where-Object { $_.Name -ne "jt-live-whisper.zip" } | Select-Object -First 1).FullName
 
-    $remoteVer = (Select-String -Path "$tmpDir\repo\translate_meeting.py" -Pattern 'APP_VERSION\s*=\s*"(.+)"' |
+    if (-not $repoDir -or -not (Test-Path (Join-Path $repoDir "translate_meeting.py"))) {
+        check_fail "下載的檔案不完整，請檢查網路連線"
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+
+    $remoteVer = (Select-String -Path (Join-Path $repoDir "translate_meeting.py") -Pattern 'APP_VERSION\s*=\s*"(.+)"' |
                   Select-Object -First 1).Matches.Groups[1].Value
     $localVer  = (Select-String -Path (Join-Path $SCRIPT_DIR "translate_meeting.py") -Pattern 'APP_VERSION\s*=\s*"(.+)"' |
                   Select-Object -First 1).Matches.Groups[1].Value
@@ -328,7 +335,7 @@ if ($Upgrade) {
     # 更新檔案
     $updated = 0
     foreach ($f in @("translate_meeting.py","start.sh","start.ps1","install.sh","install.ps1","SOP.md")) {
-        $src = Join-Path "$tmpDir\repo" $f
+        $src = Join-Path $repoDir $f
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $SCRIPT_DIR $f) -Force
             $updated++

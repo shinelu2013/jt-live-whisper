@@ -1,6 +1,6 @@
 # jt-live-whisper 安裝與使用 SOP
 
-即時英翻中字幕系統 v2.7.0 (by Jason Cheng)
+即時英翻中字幕系統 v2.7.1 (by Jason Cheng)
 
 將英文語音即時轉錄並翻譯成繁體中文字幕顯示於終端機。採用系統音訊裝置層級擷取（macOS 使用 BlackHole 虛擬音訊裝置，Windows 使用 WASAPI Loopback），**理論上任何軟體的聲音輸出都能即時處理**：視訊會議（Zoom、Teams、Meet）、YouTube、Podcast、串流影片、教育訓練等，不限定特定應用程式。亦可離線處理音訊檔案。
 
@@ -1254,6 +1254,32 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ---
 
 ## 八、Changelog
+
+### v2.7.1 (2026-03-12)
+
+**改進**
+- 安裝/升級不再需要 Git：install.sh 和 install.ps1 的 bootstrap 與 --upgrade 改用 zip 下載，macOS 和 Windows 都不需要預先安裝 Git
+- macOS 一鍵安裝指令改為三步驟：建立目錄（~/Apps/jt-live-whisper）、下載 install.sh、執行安裝
+- Windows 一鍵安裝指令改為三步驟：建立目錄（C:\jt-live-whisper）、下載 install.ps1、執行安裝
+- 啟動說明加上 cd 到安裝目錄的指令
+- 離線翻譯選單：LLM 模型列表下方以分隔線附加 NLLB/Argos 本機離線翻譯選項
+- 即時模式 GPU 伺服器路徑：辨識模型選單移到辨識位置之後（翻譯引擎之前）
+
+**修正**
+- 修正 install.sh bootstrap 在非函式環境使用 local 變數的錯誤
+- 修正 install.sh --upgrade 時誤觸 bootstrap 的問題
+- 修正 install.sh SSH key 不存在時的處理：自動產生 SSH Key 並部署公鑰到伺服器
+- 修正 install.sh Intel Mac 上 remote_whisper_server.py 不存在導致 set -e 中斷的問題
+- 修正 install.ps1 GPU 伺服器已安裝套件仍顯示「安裝中」的問題（加入預檢查）
+- 修正 install.ps1 server.py 每次都重新部署的問題（加入 hash 比對）
+- install.sh / install.ps1 執行中程序檢查新增 K 選項（強制結束後繼續安裝）
+
+**文件**
+- GPU 伺服器描述更新：明確說明支援 DGX Spark 及消費級 RTX 4090/5090 + CUDA
+- 核心功能描述更新為「中日英即時翻譯字幕」
+- 移除 Windows 安裝需求中的 Git
+- 移除 macOS git clone 安裝方式
+- PowerShell 安裝指令分為獨立區塊，避免多行貼上問題
 
 ### v2.7.0 (2026-03-11)
 

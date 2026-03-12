@@ -9,31 +9,35 @@ set -e
 GITHUB_REPO="https://github.com/jasoncheng7115/jt-live-whisper.git"
 GITHUB_RAW="https://raw.githubusercontent.com/jasoncheng7115/jt-live-whisper/main"
 
-# ─── Bootstrap：透過 curl | bash 執行時，自動 clone 並安裝 ───
+# ─── Bootstrap：透過 curl | bash 執行時，自動下載並安裝 ───
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-if [ ! -f "$SCRIPT_DIR/translate_meeting.py" ]; then
+_is_upgrade=false
+for _arg in "$@"; do [ "$_arg" = "--upgrade" ] && _is_upgrade=true; done
+if [ ! -f "$SCRIPT_DIR/translate_meeting.py" ] && [ "$_is_upgrade" = false ]; then
     echo ""
     echo -e "\033[38;2;100;180;255m============================================================\033[0m"
     echo -e "\033[38;2;100;180;255m\033[1m  jt-live-whisper - 一鍵安裝\033[0m"
     echo -e "\033[38;2;100;180;255m============================================================\033[0m"
     echo ""
 
-    # 檢查 git
-    if ! command -v git &>/dev/null; then
-        echo -e "\033[38;2;255;220;80m[提醒] 需要 git，正在觸發 Xcode Command Line Tools 安裝...\033[0m"
-        xcode-select --install 2>/dev/null || true
-        echo -e "\033[38;2;255;255;255m安裝完成後請重新執行此指令。\033[0m"
-        exit 1
-    fi
-
-    INSTALL_DIR="./jt-live-whisper"
-    if [ -d "$INSTALL_DIR" ]; then
+    INSTALL_DIR="$HOME/Apps/jt-live-whisper"
+    if [ -f "$INSTALL_DIR/translate_meeting.py" ]; then
         echo -e "\033[38;2;255;255;255m目錄已存在: $INSTALL_DIR\033[0m"
         echo -e "\033[38;2;255;255;255m進入目錄執行安裝...\033[0m"
         cd "$INSTALL_DIR"
     else
         echo -e "\033[38;2;255;255;255m正在從 GitHub 下載 jt-live-whisper...\033[0m"
-        git clone "$GITHUB_REPO" "$INSTALL_DIR"
+        tmp_zip="/tmp/jt-live-whisper-$$.zip"
+        tmp_extract="/tmp/jt-extract-$$"
+        curl -fsSL "https://github.com/jasoncheng7115/jt-live-whisper/archive/refs/heads/main.zip" -o "$tmp_zip"
+        if [ ! -f "$tmp_zip" ]; then
+            echo -e "\033[38;2;255;80;80m[錯誤] 下載失敗，請檢查網路連線\033[0m"
+            exit 1
+        fi
+        unzip -q "$tmp_zip" -d "$tmp_extract"
+        mkdir -p "$INSTALL_DIR"
+        cp -R "$tmp_extract"/jt-live-whisper-main/* "$INSTALL_DIR/"
+        rm -rf "$tmp_zip" "$tmp_extract"
         cd "$INSTALL_DIR"
     fi
 
@@ -137,7 +141,7 @@ spinner_stop() {
 print_title() {
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.7.0 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
+    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.7.1 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
     echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
     echo -e "${C_TITLE}============================================================${NC}"
     echo ""
@@ -919,26 +923,28 @@ print('OK')
 do_upgrade() {
     section "從 GitHub 升級程式"
 
-    # 檢查 git
-    if ! command -v git &>/dev/null; then
-        check_fail "找不到 git，請先安裝：brew install git"
-        return 1
-    fi
-
     # 建立暫存目錄
     local tmp_dir
     tmp_dir=$(mktemp -d)
     trap "rm -rf '$tmp_dir'" EXIT
 
     echo -e "  ${C_DIM}正在從 GitHub 下載最新版本...${NC}"
-    if ! git clone --depth 1 "$GITHUB_REPO" "$tmp_dir/repo" 2>/dev/null; then
+    local zip_path="$tmp_dir/jt-live-whisper.zip"
+    if ! curl -fsSL "https://github.com/jasoncheng7115/jt-live-whisper/archive/refs/heads/main.zip" -o "$zip_path"; then
         check_fail "無法連接 GitHub，請檢查網路連線"
+        return 1
+    fi
+    unzip -q "$zip_path" -d "$tmp_dir"
+    local repo_dir="$tmp_dir/jt-live-whisper-main"
+
+    if [ ! -f "$repo_dir/translate_meeting.py" ]; then
+        check_fail "下載的檔案不完整，請檢查網路連線"
         return 1
     fi
 
     # 取得伺服器版本號
     local remote_version
-    remote_version=$(grep -m1 'APP_VERSION' "$tmp_dir/repo/translate_meeting.py" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
+    remote_version=$(grep -m1 'APP_VERSION' "$repo_dir/translate_meeting.py" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
     local local_version
     local_version=$(grep -m1 'APP_VERSION' "$SCRIPT_DIR/translate_meeting.py" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
 
@@ -963,8 +969,8 @@ do_upgrade() {
     # 更新主要程式檔案
     local files_updated=0
     for fname in translate_meeting.py start.sh install.sh SOP.md; do
-        if [ -f "$tmp_dir/repo/$fname" ]; then
-            cp "$tmp_dir/repo/$fname" "$SCRIPT_DIR/$fname"
+        if [ -f "$repo_dir/$fname" ]; then
+            cp "$repo_dir/$fname" "$SCRIPT_DIR/$fname"
             ((files_updated++)) || true
         fi
     done
