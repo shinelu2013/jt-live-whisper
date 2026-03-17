@@ -244,6 +244,55 @@ function venv_import_ok($module) {
     return ($LASTEXITCODE -eq 0)
 }
 
+function hf_download($repo, $desc, $localDir) {
+    # HuggingFace 模型下載，SSL 失敗時自動停用憑證驗證重試
+    $localDirArg = if ($localDir) { ", local_dir=r'$localDir'" } else { "" }
+    $dlResult = & $VENV_PYTHON -c @"
+import os
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+from huggingface_hub import snapshot_download
+try:
+    snapshot_download('$repo'$localDirArg)
+    print('OK')
+except Exception as e:
+    err = str(e)
+    if 'SSL' in err or 'CERTIFICATE' in err.upper() or 'ssl' in err:
+        print('SSL_RETRY')
+    else:
+        print('FAIL:' + err[:300])
+"@ 2>&1
+
+    if ($dlResult -match "^SSL_RETRY") {
+        check_notice "SSL 憑證驗證失敗（常見於企業網路），嘗試停用驗證重新下載..."
+        $dlResult = & $VENV_PYTHON -c @"
+import os
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
+session = requests.Session()
+session.verify = False
+from huggingface_hub import snapshot_download, configure_http_backend
+configure_http_backend(backend_factory=lambda: session)
+try:
+    snapshot_download('$repo'$localDirArg)
+    print('OK')
+except Exception as e:
+    print('FAIL:' + str(e)[:300])
+"@ 2>&1
+    }
+
+    if ($dlResult -match "^OK") {
+        return "ok"
+    }
+    $errMsg = ($dlResult -replace "^FAIL:", "").Trim()
+    check_notice "${desc}下載失敗，可稍後在有網路時重新執行安裝"
+    if ($errMsg) { info "  錯誤詳情: $errMsg" }
+    return "fail"
+}
+
 # ─── Banner ───────────────────────────────────────────────────
 
 $cols = try { $Host.UI.RawUI.WindowSize.Width } catch { 60 }
@@ -252,7 +301,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.11.2 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
 Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
@@ -505,13 +554,11 @@ if (cmd_exists "nvidia-smi") {
             check_ok "NVIDIA GPU: ${GPU_NAME} ($([math]::Round($GPU_MEMORY_MB/1024,1)) GB)"
             check_ok "CUDA 驅動: ${CUDA_VERSION}"
 
-            # CUDA 13+ 警告：faster-whisper (CTranslate2) 需要 CUDA 12.x 的 cublas64_12.dll
+            # CUDA 13+：faster-whisper (CTranslate2) 需要 CUDA 12.x 的 cublas64_12.dll
+            $CUDA_13_PLUS = $false
             if ($CUDA_VERSION -match "^1[3-9]\.") {
-                check_notice "CUDA ${CUDA_VERSION} 偵測到 — faster-whisper 需要 CUDA 12.x 程式庫"
-                info "  faster-whisper 使用的 CTranslate2 需要 cublas64_12.dll（CUDA 12.x）"
-                info "  請另外安裝 CUDA Toolkit 12.8（可與 13.x 並存）："
-                info "  https://developer.nvidia.com/cuda-12-8-0-download-archive"
-                info "  否則會出現「Library cublas64_12.dll is not found」錯誤"
+                $CUDA_13_PLUS = $true
+                check_notice "CUDA ${CUDA_VERSION} 偵測到 — 將自動安裝 CUDA 12.x 相容程式庫"
             }
 
             # 對應 PyTorch CUDA wheel 版本
@@ -685,6 +732,10 @@ if ($GPU_AVAILABLE) {
     # cuDNN（faster-whisper CUDA 加速需要）
     $cudnnPkg = if ($TORCH_CUDA_TAG -eq "cu118") { "nvidia-cudnn-cu11" } else { "nvidia-cudnn-cu12" }
     $null = pip_install $cudnnPkg "cuDNN (CUDA 深度學習加速)" @()
+    # CUDA 13+：自動安裝 CUDA 12.x cuBLAS（CTranslate2/faster-whisper 需要 cublas64_12.dll）
+    if ($CUDA_13_PLUS) {
+        $null = pip_install "nvidia-cublas-cu12" "cuBLAS 12.x（CUDA 13+ 相容層）" @()
+    }
 } else {
     $null = pip_install "torch" "PyTorch (CPU)" @("--index-url", "https://download.pytorch.org/whl/cpu")
 }
@@ -828,20 +879,12 @@ if ((Test-Path (Join-Path $NLLB_MODEL_DIR "model.bin")) -and
     check_ok "NLLB 模型已安裝（$NLLB_MODEL_DIR）"
 } else {
     info "下載 NLLB 600M 模型（約 600MB）..."
-    # 確保 huggingface_hub 已安裝
     & $VENV_PYTHON -m pip install --disable-pip-version-check -q huggingface_hub 2>$null | Out-Null
     New-Item -ItemType Directory -Path $NLLB_MODEL_DIR -Force | Out-Null
-    & $VENV_PYTHON -c @"
-from huggingface_hub import snapshot_download
-snapshot_download('JustFrederik/nllb-200-distilled-600M-ct2-int8',
-                  local_dir=r'$NLLB_MODEL_DIR')
-print('OK')
-"@ 2>&1 | Out-Null
+    $null = hf_download "JustFrederik/nllb-200-distilled-600M-ct2-int8" "NLLB 模型" $NLLB_MODEL_DIR
 
     if (Test-Path (Join-Path $NLLB_MODEL_DIR "model.bin")) {
         check_ok "NLLB 模型安裝完成"
-    } else {
-        check_notice "NLLB 模型下載失敗，可稍後在有網路時重新執行安裝"
     }
 }
 
@@ -1200,11 +1243,7 @@ if ($fwModelFound -eq "found") {
 } else {
     info "下載 faster-whisper large-v3-turbo 模型（約 1.6GB）..."
     & $VENV_PYTHON -m pip install --disable-pip-version-check -q huggingface_hub 2>$null | Out-Null
-    & $VENV_PYTHON -c @"
-from huggingface_hub import snapshot_download
-snapshot_download('Systran/faster-whisper-large-v3-turbo')
-print('OK')
-"@ 2>&1 | Out-Null
+    $null = hf_download "Systran/faster-whisper-large-v3-turbo" "faster-whisper 模型" ""
 
     # 驗證下載
     $fwVerify = & $VENV_PYTHON -c @"
@@ -1230,8 +1269,6 @@ print('found' if found else 'notfound')
 
     if ($fwVerify -eq "found") {
         check_ok "faster-whisper 模型 large-v3-turbo 安裝完成"
-    } else {
-        check_notice "faster-whisper 模型下載失敗，可稍後在有網路時重新執行安裝"
     }
 }
 

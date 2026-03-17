@@ -1,5 +1,30 @@
 # Changelog
 
+### v2.12.0 (2026-03-17)
+
+**新功能**
+- 英中雙向模式麥克風支援中英混雜輸入：以語言預偵測（detect_language）判斷每段音訊的語言，中文自動翻譯為英文，英文直接顯示不翻譯
+  - macOS mlx-whisper：方案 A（wave + scipy resample 取代 ffmpeg）+ 方案 B（直接 model.decode 繞過 transcribe，mel 只算一次）大幅加速
+  - Windows faster-whisper：透過 fw_model.detect_language() 預偵測，搭配 VAD 過濾
+  - 啟動時預熱 detect_language + decode 路徑（中/英兩種語言），避免首次辨識延遲
+- 離線處理配對自動偵測：選到含「系統音訊」或「麥克風」的單一檔案時，自動尋找同時間戳的配對檔案並提示一起處理
+
+**改進**
+- Ctrl+C 全面改善：所有即時模式的 signal handler 改用 `_force_exit()`（os._exit + 終止 resource_tracker），不再出現 segfault 或 semaphore 警告。按兩次 Ctrl+C 可強制結束
+- HuggingFace 模型下載 SSL 容錯：install.ps1 / install.sh / translate_meeting.py 三處加入 SSL 憑證驗證失敗時自動停用驗證重試（企業網路常見的中間人憑證問題）
+- install.ps1 CUDA 13+ 自動安裝相容程式庫：偵測到 CUDA 13.x 時自動 `pip install nvidia-cublas-cu12`，不再只是顯示警告
+- 翻譯結果簡轉繁：所有即時模式的 LLM/NLLB 翻譯結果統一套用 S2TWP 繁體轉換，避免翻譯輸出殘留簡體字
+- 即時辨識去重改善：新增 SequenceMatcher 字元相似度比對（>60%），解決滑動視窗重疊導致的近似重複（如「Windows跟Limps」vs「Windows跟Linux」）
+- AirPods 麥克風靈敏度：降低 mic RMS 門檻（基礎 0.003、echo gate 0.015），正常音量即可辨識
+- 用語修正：「滑動窗口」統一改為台灣用語「滑動視窗」
+
+**修正**
+- 修正中文幻覺偵測遺漏：改用 regex 偵測任意位置的短片段重複（如「有多少多少多少...」）
+- 修正即時辨識 `Failed to load audio:` 錯誤：`transcribe_chunk` 新增 WAV 檔案存在性 + stop_event 檢查
+- 修正配對處理 log 檔名開頭：非雙向模式走配對處理時，檔名改用「配對時間逐字稿」
+- 修正配對處理摘要「來源音訊」只顯示單檔：改為同時顯示系統音訊與麥克風雙檔名
+- 修正摘要檔名映射遺漏：補上「日中雙向」和所有「配對」開頭對應
+
 ### v2.11.2 (2026-03-16)
 
 **改進**
@@ -81,7 +106,7 @@
 - 中文幻覺過濾增強：單字頻率 >60%、連續重複 6 次以上、新增「初音」等關鍵字
 - `initial_prompt` 僅套用於 medium 以上模型，避免 small 模型回聲洩漏
 - 新增 `_PROMPT_LEAK_TEXTS` 安全過濾，移除辨識結果中殘留的 prompt 文字
-- MLX 模型倉庫名稱修正：自動對應正確的 HuggingFace repo 後綴（large-v3-turbo 無後綴、其他加 -mlx）
+- MLX 模型倉庫名稱修正：自動對應正確的 HuggingFace repo 字尾（large-v3-turbo 無字尾、其他加 -mlx）
 - 暖機使用實際語言參數，避免 MLX 重新編譯導致首次辨識 11 秒以上
 - 狀態列 resize 殘影清除邏輯改善：擴大清除範圍、不依賴游標 save/restore
 - start.ps1 重複執行檢查新增 K 選項（終止舊程序後繼續）
@@ -442,7 +467,7 @@
 ### v1.9.6 (2026-03-06)
 
 **改進**
-- 所有輸出檔案改用中文前綴命名，一目了然：
+- 所有輸出檔案改用中文開頭命名，一目了然：
   - 逐字稿：`英翻中_逐字稿_`、`中翻英_逐字稿_`、`英文_逐字稿_`、`中文_逐字稿_`
   - 摘要：`英翻中_摘要_`、`中翻英_摘要_`、`英文_摘要_`、`中文_摘要_`
   - 錄音：`錄音_`
@@ -450,7 +475,7 @@
 - 支援透過 config.json 設定錄音格式（`recording_format`：mp3/ogg/flac/wav）
 - 錄音期間仍以 WAV 暫存（保留 30 秒 header 更新防當機機制），停止時自動轉檔
 - 轉檔失敗時保留原始 WAV 檔，不中斷程式運作
-- --input 暫存檔改為 `tmp_` 前綴（不再是隱藏檔）
+- --input 暫存檔改為 `tmp_` 開頭（不再是隱藏檔）
 
 ### v1.9.4 (2026-03-05)
 
@@ -544,7 +569,7 @@
 
 **改進**
 - 講者辨識精準度提升：啟用 SpectralClusterer refinement（高斯模糊 + 行最大值門檻），抑制噪音相似度
-- 講者辨識：長段落（>= 1.6s）改用滑動窗口 embedding + 中位數，聲紋特徵更穩定
+- 講者辨識：長段落（>= 1.6s）改用滑動視窗 embedding + 中位數，聲紋特徵更穩定
 - 講者辨識：連續短段落（< 0.8s）合併音訊後再提取 embedding，避免碎片化
 - 講者辨識：分群後增加餘弦相似度二次校正，差距明顯（> 0.1）時重新指派講者
 - 講者辨識：平滑修正從孤立段落修正升級為窗口 5 多數決，更穩定

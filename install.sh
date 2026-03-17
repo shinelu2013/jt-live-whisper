@@ -111,6 +111,61 @@ run_spinner() {
     return $rc
 }
 
+# HuggingFace 模型下載（SSL 失敗時自動停用憑證驗證重試）
+# 用法: hf_download "repo_id" "描述" ["local_dir"]
+hf_download() {
+    local repo="$1" desc="$2" local_dir="$3"
+    local local_dir_arg=""
+    [ -n "$local_dir" ] && local_dir_arg=", local_dir='$local_dir'"
+
+    local result
+    result=$(python3 -c "
+import os
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+from huggingface_hub import snapshot_download
+try:
+    snapshot_download('$repo'$local_dir_arg)
+    print('OK')
+except Exception as e:
+    err = str(e)
+    if 'SSL' in err or 'CERTIFICATE' in err.upper() or 'ssl' in err:
+        print('SSL_RETRY')
+    else:
+        print('FAIL:' + err[:300])
+" 2>&1)
+
+    if echo "$result" | grep -q "^SSL_RETRY"; then
+        check_notice "SSL 憑證驗證失敗（常見於企業網路），嘗試停用驗證重新下載..."
+        result=$(python3 -c "
+import os
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
+session = requests.Session()
+session.verify = False
+from huggingface_hub import snapshot_download, configure_http_backend
+configure_http_backend(backend_factory=lambda: session)
+try:
+    snapshot_download('$repo'$local_dir_arg)
+    print('OK')
+except Exception as e:
+    print('FAIL:' + str(e)[:300])
+" 2>&1)
+    fi
+
+    if echo "$result" | grep -q "^OK"; then
+        return 0
+    fi
+    local err_msg
+    err_msg=$(echo "$result" | sed -n 's/^FAIL://p')
+    check_notice "${desc}下載失敗，可稍後在有網路時重新執行安裝"
+    [ -n "$err_msg" ] && echo "  ${C_DIM}錯誤詳情: $err_msg${NC}"
+    return 1
+}
+
 # 背景 Spinner：檢查階段用，不吞輸出
 # 用法: spinner_start "訊息" → （執行檢查，輸出存到暫存檔）→ spinner_stop → cat 暫存檔
 _SPINNER_PID=""
@@ -141,7 +196,7 @@ spinner_stop() {
 print_title() {
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.11.2 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
+    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
     echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
     echo -e "${C_TITLE}============================================================${NC}"
     echo ""
@@ -923,12 +978,7 @@ check_nllb_model() {
         pip install --disable-pip-version-check -q huggingface_hub 2>/dev/null
         mkdir -p "$NLLB_MODEL_DIR"
         echo ""
-        run_spinner "下載模型..." python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('JustFrederik/nllb-200-distilled-600M-ct2-int8',
-                  local_dir='$NLLB_MODEL_DIR')
-print('OK')
-"
+        hf_download "JustFrederik/nllb-200-distilled-600M-ct2-int8" "NLLB 模型" "$NLLB_MODEL_DIR"
         echo ""
         deactivate
 
@@ -994,11 +1044,7 @@ print('found' if found else 'notfound')
         fi
         check_install "正在下載 faster-whisper $fw_model 模型（$fw_size）..."
         echo ""
-        run_spinner "下載模型..." python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('Systran/faster-whisper-$fw_model')
-print('OK')
-"
+        hf_download "Systran/faster-whisper-$fw_model" "faster-whisper 模型" ""
         echo ""
 
         # 驗證下載
@@ -1088,11 +1134,7 @@ print('found' if found else 'notfound')
     else
         check_install "正在下載 MLX Whisper $mlx_model 模型（約 1.6GB）..."
         echo ""
-        run_spinner "下載模型..." python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('mlx-community/whisper-$mlx_model')
-print('OK')
-"
+        hf_download "mlx-community/whisper-$mlx_model" "MLX Whisper 模型" ""
         echo ""
 
         # 驗證下載
@@ -1317,7 +1359,7 @@ print('ok' if types else 'no')
     # ── 4. 編譯（分步驟顯示進度）──
     # gpu_arch="12.1" → cmake_arch="121"（移除小數點）
     local cmake_arch="${gpu_arch//.}"
-    # 所有編譯步驟共用的環境變數前綴（確保 nvcc 在 PATH、libctranslate2 可被找到）
+    # 所有編譯步驟共用的環境變數開頭（確保 nvcc 在 PATH、libctranslate2 可被找到）
     local CUDA_ENV="export PATH=${cuda_bin_dir}:\$PATH && export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH"
     echo -e "  ${C_WHITE}  開始編譯 CTranslate2（預計 10-20 分鐘）...${NC}"
 

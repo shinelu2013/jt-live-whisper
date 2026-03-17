@@ -24,6 +24,42 @@ from collections import deque
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 
+
+_hf_ssl_bypassed = False
+
+
+def _enable_hf_ssl_bypass():
+    """企業網路 SSL 中間人憑證對策：停用 HuggingFace 下載的 SSL 驗證"""
+    global _hf_ssl_bypassed
+    if _hf_ssl_bypassed:
+        return
+    _hf_ssl_bypassed = True
+    os.environ["CURL_CA_BUNDLE"] = ""
+    os.environ["REQUESTS_CA_BUNDLE"] = ""
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        import requests
+        _s = requests.Session()
+        _s.verify = False
+        from huggingface_hub import configure_http_backend
+        configure_http_backend(backend_factory=lambda: _s)
+    except Exception:
+        pass
+
+
+def _call_with_ssl_retry(fn, *args, **kwargs):
+    """呼叫 fn，若 SSL 錯誤則停用驗證後重試一次"""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        err = str(e)
+        if "SSL" in err or "CERTIFICATE" in err.upper() or "ssl" in err:
+            print(f"\n  [注意] SSL 憑證驗證失敗，嘗試停用驗證重試...", flush=True)
+            _enable_hf_ssl_bypass()
+            return fn(*args, **kwargs)
+        raise
+
 if IS_WINDOWS:
     import msvcrt
 else:
@@ -255,6 +291,21 @@ for _nd in _nllb_search_dirs:
 _LOOPBACK_LABEL = "WASAPI Loopback" if IS_WINDOWS else "BlackHole 2ch"
 _START_CMD = ".\\start.ps1" if IS_WINDOWS else "./start.sh"
 _INSTALL_CMD = ".\\install.ps1" if IS_WINDOWS else "./install.sh"
+
+
+def _force_exit(code=0):
+    """強制結束程序。一律用 os._exit() 避免卡在 C 擴展（CTranslate2/MLX Metal）。
+    signal handler 在呼叫前已完成音訊裝置清理。"""
+    if not IS_WINDOWS:
+        # macOS：殺掉 resource_tracker 子程序，避免 semaphore 洩漏警告
+        try:
+            import multiprocessing.resource_tracker as _rt
+            _pid = getattr(_rt._resource_tracker, '_pid', None)
+            if _pid:
+                os.kill(_pid, 9)  # SIGKILL
+        except Exception:
+            pass
+    os._exit(code)
 
 
 def _is_loopback_device(name):
@@ -661,7 +712,7 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "2.11.2"
+APP_VERSION = "2.12.0"
 
 # 常見 LLM 伺服器預設 port（供參考）
 LLM_PRESETS = [
@@ -978,7 +1029,7 @@ def select_whisper_model(mode="en2zh", use_faster_whisper=False):
     name, filename, path, desc, installed = selected
     # 未安裝的模型：自動下載
     if not installed:
-        # 模型名稱 = 去掉 ggml- 前綴和 .bin 後綴
+        # 模型名稱 = 去掉 ggml- 開頭和 .bin 字尾
         dl_name = filename.replace("ggml-", "").replace(".bin", "")
         dl_script = os.path.join(MODELS_DIR, "download-ggml-model.sh")
         if os.path.isfile(dl_script):
@@ -2044,7 +2095,7 @@ def _ssh_close_cm(rw_cfg):
 
 def _inline_spinner(func, *args, **kwargs):
     """執行 func 同時顯示行內 spinner 動畫，回傳 func 結果。
-    呼叫前須先 print(..., end="", flush=True) 輸出前綴文字。"""
+    呼叫前須先 print(..., end="", flush=True) 輸出開頭文字。"""
     _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     result = [None]
     error = [None]
@@ -3606,7 +3657,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     audio_monitor = None
 
     # 設定 signal handler
+    _sigint_count_ws = [0]
+
     def signal_handler(signum, frame):
+        _sigint_count_ws[0] += 1
+        if _sigint_count_ws[0] >= 2:
+            _force_exit(1)
         clear_status_bar()
         restore_terminal()
         stop_keypress.set()
@@ -3633,13 +3689,13 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
         proc.terminate()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
         # 清理暫存檔
         if os.path.exists(output_file):
             os.remove(output_file)
-        sys.exit(0)
+        _force_exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -3732,6 +3788,8 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         t0 = time.monotonic()
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
+        if result:
+            result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(log_path)
@@ -4042,6 +4100,8 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         t0 = time.monotonic()
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
+        if result:
+            result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(log_path)
@@ -4302,12 +4362,17 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
 
     # Signal handler
+    _sigint_count_ms = [0]
+
     def signal_handler(signum, frame):
+        _sigint_count_ms[0] += 1
+        if _sigint_count_ms[0] >= 2:
+            _force_exit(1)
         clear_status_bar()
         restore_terminal()
         _cleanup_moonshine()
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
-        sys.exit(0)
+        _force_exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -4651,6 +4716,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         t0 = time.monotonic()
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
+        if result:
+            result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(_log_path)
@@ -4786,12 +4853,17 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         # 伺服器保持執行（不停止，允許多實例共用）
         _ssh_close_cm(remote_cfg)
 
+    _sigint_count_rm = [0]
+
     def signal_handler(signum, frame):
+        _sigint_count_rm[0] += 1
+        if _sigint_count_rm[0] >= 2:
+            _force_exit(1)
         clear_status_bar()
         restore_terminal()
         _cleanup_remote()
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
-        sys.exit(0)
+        _force_exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -4957,7 +5029,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
         warnings.filterwarnings("ignore", category=FutureWarning)
-        fw_model = WhisperModel(model_name, device="auto", compute_type="int8")
+        fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="int8")
     _hf_logger.setLevel(_hf_log_level)
     if _fw_need_download:
         print(f"  {C_OK}模型下載完成（{time.monotonic() - t0:.1f}s）{RESET}")
@@ -5209,6 +5281,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         t0 = time.monotonic()
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
+        if result:
+            result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(_log_path)
@@ -5354,12 +5428,17 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             print(f"\n  {C_OK}錄音已儲存: {rec_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
 
+    _sigint_count_lc = [0]
+
     def signal_handler(signum, frame):
+        _sigint_count_lc[0] += 1
+        if _sigint_count_lc[0] >= 2:
+            _force_exit(1)
         clear_status_bar()
         restore_terminal()
         _cleanup_local()
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
-        sys.exit(0)
+        _force_exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -5495,6 +5574,10 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     mic_lang = _MIC_LANG[mode]
     lb_hallu = _LB_HALLU[mode]
     mic_hallu = _MIC_HALLU[mode]
+    # en_zh 雙向：麥克風用語言預偵測（detect_language → 正確語言辨識），英文結果跳過翻譯
+    _mic_skip_english = (mode == "en_zh")
+    if _mic_skip_english:
+        mic_lang = None  # 觸發 local_transcribe 內的語言預偵測
 
     # ── 翻譯記錄檔 ──
     from datetime import datetime
@@ -5526,7 +5609,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         except Exception:
             pass
         import mlx_whisper as _mlx_whisper_mod
-        # MLX 社群 repo 命名不一致：large-v3-turbo 無後綴，其餘需加 -mlx
+        # MLX 社群 repo 命名不一致：large-v3-turbo 無字尾，其餘需加 -mlx
         _MLX_REPO_SUFFIX = {"large-v3-turbo": "", "large-v3": "-mlx",
                             "medium": "-mlx", "small": "-mlx",
                             "base": "-mlx", "tiny": "-mlx"}
@@ -5578,8 +5661,43 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             # 用 lb_lang 預熱；若 mic_lang 不同則再預熱一次（避免首次辨識觸發 MLX 重編譯）
-            _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=lb_lang)
-            if mic_lang != lb_lang:
+            _call_with_ssl_retry(_mlx_whisper_mod.transcribe, _warmup_path, path_or_hf_repo=_mlx_repo, language=lb_lang)
+            if mic_lang is None:
+                # 自動偵測模式：預熱 transcribe（中/英兩種語言）
+                _warmup_other = "zh" if lb_lang != "zh" else "en"
+                _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=_warmup_other)
+                # 預熱 detect_language + direct_decode 路徑（避免首次辨識觸發 MLX JIT 編譯）
+                import mlx.core as _warmup_mx
+                from mlx_whisper.transcribe import ModelHolder as _WarmupMH
+                from mlx_whisper.decoding import DecodingOptions as _WarmupDO
+                from mlx_whisper.tokenizer import get_tokenizer as _warmup_get_tok
+                _w_model = _WarmupMH.get_model(_mlx_repo, _warmup_mx.float16)
+                _w_mel = _mlx_whisper_mod.audio.log_mel_spectrogram(
+                    _warmup_path, n_mels=_w_model.dims.n_mels,
+                    padding=_mlx_whisper_mod.audio.N_SAMPLES,
+                )
+                _w_mel_seg = _mlx_whisper_mod.audio.pad_or_trim(
+                    _w_mel, _mlx_whisper_mod.audio.N_FRAMES, axis=-2
+                ).astype(_warmup_mx.float16)
+                _w_model.detect_language(_w_mel_seg)
+                # 預熱 decode 路徑（tokenizer + model.decode JIT，sample_len 需與實際一致）
+                _w_tok = _warmup_get_tok(_w_model.is_multilingual,
+                    num_languages=_w_model.num_languages, language="zh", task="transcribe")
+                _w_opts = _WarmupDO(language="zh", task="transcribe", temperature=0.0,
+                    sample_len=25, fp16=True)
+                try:
+                    _w_model.decode(_w_mel_seg, _w_opts)
+                except Exception:
+                    pass
+                # 也預熱英文 decode（避免首次切換到英文時 JIT 重編譯）
+                _w_opts_en = _WarmupDO(language="en", task="transcribe", temperature=0.0,
+                    sample_len=25, fp16=True)
+                try:
+                    _w_model.decode(_w_mel_seg, _w_opts_en)
+                except Exception:
+                    pass
+                del _w_model, _w_mel, _w_mel_seg, _w_tok, _w_opts, _w_opts_en
+            elif mic_lang != lb_lang:
                 _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=mic_lang)
         _hf_logger.setLevel(_hf_log_level)
         # 恢復 HF 進度條設定
@@ -5648,7 +5766,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
-            fw_model = WhisperModel(model_name, device="auto", compute_type="int8")
+            fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="int8")
         _hf_logger.setLevel(_hf_log_level)
         if _fw_need_download:
             print(f"  {C_OK}模型下載完成（{time.monotonic() - t0:.1f}s）{RESET}")
@@ -5724,8 +5842,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     print(f"  {C_HIGHLIGHT}  1. 建議使用耳機，避免麥克風收到系統音訊的回音{RESET}")
     print(f"  {C_HIGHLIGHT}  2. 請將非說話用的麥克風停用或輸入音量拉到最低，{RESET}")
     print(f"  {C_HIGHLIGHT}     以免影響辨識與翻譯品質{RESET}")
+    _hint_n = 3
     if not mic_translate:
-        print(f"  {C_HIGHLIGHT}  3. ASR 雙路辨識（非 whisper-stream），辨識負載加倍{RESET}")
+        print(f"  {C_HIGHLIGHT}  {_hint_n}. ASR 雙路辨識（非 whisper-stream），辨識負載加倍{RESET}")
+        _hint_n += 1
+    if _mic_skip_english:
+        print(f"  {C_OK}  {_hint_n}. 麥克風支援中英混雜，開始幾句辨識較慢屬正常（模型預熱中）{RESET}")
     print(f"  {C_DIM}按 Ctrl+P 暫停/繼續 ─ Ctrl+C 停止{RESET}")
     print(f"{C_TITLE}{'=' * 60}{RESET}")
     print()
@@ -5860,7 +5982,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
     def extract_wav_mic():
         """提取麥克風環形緩衝，寫入暫存 WAV 檔，回傳 (path, peak_rms)。
-        用 0.5s 滑動窗口的峰值 RMS（最近 step_sec 內），精準偵測短暫語音。"""
+        用 0.5s 滑動視窗的峰值 RMS（最近 step_sec 內），精準偵測短暫語音。"""
         with mic_ring_lock:
             pos = mic_ring_write_pos
             buf_copy = mic_ring_buffer.copy()
@@ -5901,20 +6023,129 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                           "以下は日本語の音声です"}
 
     if use_mlx:
+        # 預載語言偵測所需模組（en_zh 麥克風自動偵測中/英）
+        if _mic_skip_english:
+            import mlx.core as _mx
+            from math import gcd as _gcd
+            from scipy.signal import resample_poly as _resample_poly
+            from mlx_whisper.transcribe import ModelHolder as _MLXModelHolder
+            from mlx_whisper.decoding import DecodingOptions as _MLXDecodingOptions
+            from mlx_whisper.tokenizer import get_tokenizer as _mlx_get_tokenizer
+            _mlx_audio_mod = _mlx_whisper_mod.audio
+            _WHISPER_SR = 16000  # Whisper 固定取樣率
+
+            def _load_wav_as_mx(wav_path, target_sr=_WHISPER_SR):
+                """用 wave 模組直接讀 WAV + scipy resample 到 16kHz（取代 ffmpeg 子程序）"""
+                with wave.open(wav_path, "r") as _wf:
+                    _sr = _wf.getframerate()
+                    _audio = np.frombuffer(
+                        _wf.readframes(_wf.getnframes()), dtype=np.int16
+                    ).astype(np.float32) / 32768.0
+                if _sr != target_sr:
+                    _g = _gcd(_sr, target_sr)
+                    _audio = _resample_poly(_audio, up=target_sr // _g, down=_sr // _g)
+                return _mx.array(_audio)
+
+            def _direct_decode(model, mel_seg, lang, prompt_text=None, sample_len=50):
+                """繞過 transcribe()，直接用 model.decode()（mel 只算一次）。
+                回傳 (text, no_speech_prob, avg_logprob, compression_ratio)"""
+                _tokenizer = _mlx_get_tokenizer(
+                    model.is_multilingual,
+                    num_languages=model.num_languages,
+                    language=lang, task="transcribe",
+                )
+                _prompt_tokens = []
+                if prompt_text:
+                    _prompt_tokens = _tokenizer.encode(" " + prompt_text.strip())
+                _opts = _MLXDecodingOptions(
+                    language=lang, task="transcribe",
+                    temperature=0.0, sample_len=sample_len,
+                    prompt=_prompt_tokens or None,
+                    fp16=True,
+                )
+                _result = model.decode(mel_seg, _opts)
+                _text = _tokenizer.decode(
+                    [t for t in _result.tokens if t < _tokenizer.eot]
+                )
+                return _text, _result.no_speech_prob, _result.avg_logprob, _result.compression_ratio
+
         def local_transcribe(wav_path, lang):
-            """用 mlx-whisper 辨識 WAV 檔，回傳 (segments_list, full_text, proc_time)"""
+            """用 mlx-whisper 辨識 WAV 檔，回傳 (segments_list, full_text, proc_time, detected_lang)"""
             t0 = time.monotonic()
+            # 語言預偵測 + 直接 decode：mel 只算一次，不經 transcribe() 重複計算
+            if lang is None:
+                _model = _MLXModelHolder.get_model(_mlx_repo, _mx.float16)
+                # 直接讀 WAV + resample（不用 ffmpeg）
+                _audio_mx = _load_wav_as_mx(wav_path)
+                _mel = _mlx_audio_mod.log_mel_spectrogram(
+                    _audio_mx, n_mels=_model.dims.n_mels,
+                    padding=_mlx_audio_mod.N_SAMPLES,
+                )
+                _mel_seg = _mlx_audio_mod.pad_or_trim(
+                    _mel, _mlx_audio_mod.N_FRAMES, axis=-2
+                ).astype(_mx.float16)
+                # 語言偵測
+                _, _probs = _model.detect_language(_mel_seg)
+                _zh_prob = _probs.get("zh", 0)
+                # 偏向中文（主要語言）：zh_prob > 30% 就用中文，避免短句被誤判為英文
+                lang = "zh" if _zh_prob > 0.3 else "en"
+                # 直接 decode（省掉 transcribe 的 mel 重算 + ffmpeg）
+                # sample_len=25：8 秒音訊約 15-20 token，25 足夠且限制誤判時的最壞延遲
+                _prompt = _WHISPER_PROMPT.get(lang)
+                try:
+                    _text, _nsp, _alp, _cr = _direct_decode(
+                        _model, _mel_seg, lang, _prompt, sample_len=25)
+                except Exception as _e:
+                    # fallback：internal API 不相容時回退到 transcribe()
+                    # temperature=0 強制單次解碼（不重試），避免 cascade 導致 30s+ 延遲
+                    with print_lock:
+                        print(f"{C_DIM}  [detect fallback: {_e}]{RESET}", flush=True)
+                    result = _mlx_whisper_mod.transcribe(wav_path,
+                        path_or_hf_repo=_mlx_repo, language=lang,
+                        word_timestamps=False, condition_on_previous_text=False,
+                        sample_len=25, temperature=0,
+                        **({"initial_prompt": _prompt} if _prompt else {}))
+                    detected_lang = result.get("language", lang) or lang
+                    segments = []
+                    texts = []
+                    for seg in result.get("segments", []):
+                        text = seg.get("text", "").strip()
+                        for _leak in _PROMPT_LEAK_TEXTS:
+                            text = text.replace(_leak, "")
+                        text = text.strip("，。、 ")
+                        if text:
+                            segments.append({"start": seg["start"], "end": seg["end"], "text": text})
+                            texts.append(text)
+                    proc_time = time.monotonic() - t0
+                    return segments, " ".join(texts), proc_time, detected_lang
+                # 過濾 no_speech / 低品質
+                if _nsp > 0.6 and _alp < -1.0:
+                    proc_time = time.monotonic() - t0
+                    return [], "", proc_time, lang
+                # 安全過濾 prompt 洩漏
+                for _leak in _PROMPT_LEAK_TEXTS:
+                    _text = _text.replace(_leak, "")
+                _text = _text.strip("，。、 ")
+                proc_time = time.monotonic() - t0
+                detected_lang = lang
+                if _text:
+                    return [{"start": 0, "end": 0, "text": _text}], _text, proc_time, detected_lang
+                return [], "", proc_time, detected_lang
+            # 非 detect 路徑：走原本的 transcribe() API
+            # bidi 模式用較小的 sample_len（35）加速，減少序列化鎖佔用時間
+            _sl = 35 if _mic_skip_english else 50
             _kw = dict(
                 path_or_hf_repo=_mlx_repo,
                 language=lang,
                 word_timestamps=False,
                 condition_on_previous_text=False,
-                sample_len=50,  # 防止幻覺導致長時間解碼（預設 224，M2 每 token ~0.2s，50 步≈10s 上限）
+                sample_len=_sl,
             )
             _prompt = _WHISPER_PROMPT.get(lang)
             if _prompt:
                 _kw["initial_prompt"] = _prompt
             result = _mlx_whisper_mod.transcribe(wav_path, **_kw)
+            detected_lang = result.get("language", lang) or lang
             segments = []
             texts = []
             for seg in result.get("segments", []):
@@ -5928,11 +6159,40 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                     texts.append(text)
             full_text = " ".join(texts)
             proc_time = time.monotonic() - t0
-            return segments, full_text, proc_time
+            return segments, full_text, proc_time, detected_lang
     else:
+        # Windows: 預載 resample 工具（en_zh mic 語言預偵測用）
+        if _mic_skip_english:
+            from math import gcd as _gcd_fw
+            from scipy.signal import resample_poly as _resample_poly_fw
+            _WHISPER_SR_FW = 16000
+
+            def _load_wav_as_np(wav_path, target_sr=_WHISPER_SR_FW):
+                """用 wave 模組直接讀 WAV + scipy resample 到 16kHz（取代 ffmpeg）"""
+                with wave.open(wav_path, "r") as _wf:
+                    _sr = _wf.getframerate()
+                    _audio = np.frombuffer(
+                        _wf.readframes(_wf.getnframes()), dtype=np.int16
+                    ).astype(np.float32) / 32768.0
+                if _sr != target_sr:
+                    _g = _gcd_fw(_sr, target_sr)
+                    _audio = _resample_poly_fw(_audio, up=target_sr // _g, down=_sr // _g)
+                return _audio
+
         def local_transcribe(wav_path, lang):
-            """用 faster-whisper 辨識 WAV 檔，回傳 (segments_list, full_text, proc_time)"""
+            """用 faster-whisper 辨識 WAV 檔，回傳 (segments_list, full_text, proc_time, detected_lang)"""
             t0 = time.monotonic()
+            # 語言預偵測：lang=None 時先用 detect_language 判斷語言，再用正確語言辨識
+            _audio_input = wav_path  # 預設傳檔案路徑
+            if lang is None:
+                # 直接讀 WAV + resample（不用 ffmpeg），detect + transcribe 共用同一份音訊
+                _audio_np = _load_wav_as_np(wav_path)
+                _audio_input = _audio_np  # 傳 numpy array 給 transcribe，省掉第二次 ffmpeg
+                _det, _det_prob, _all_probs = fw_model.detect_language(_audio_np)
+                # 偏向中文（主要語言）：zh > 30% 就用中文（與 macOS 邏輯一致）
+                _prob_dict = dict(_all_probs)
+                _zh_prob_fw = _prob_dict.get("zh", 0)
+                lang = "zh" if _zh_prob_fw > 0.3 else "en"
             _kw = dict(
                 language=lang, beam_size=1, best_of=1,
                 temperature=0, condition_on_previous_text=False,
@@ -5942,7 +6202,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             _prompt = _WHISPER_PROMPT.get(lang)
             if _prompt:
                 _kw["initial_prompt"] = _prompt
-            segments_iter, info = fw_model.transcribe(wav_path, **_kw)
+            segments_iter, info = fw_model.transcribe(_audio_input, **_kw)
+            detected_lang = getattr(info, "language", lang) or lang
             segments = []
             texts = []
             for seg in segments_iter:
@@ -5956,7 +6217,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                     texts.append(text)
             full_text = " ".join(texts)
             proc_time = time.monotonic() - t0
-            return segments, full_text, proc_time
+            return segments, full_text, proc_time, detected_lang
 
     # ── 非同步翻譯（兩組獨立佇列，共用 print_lock）──
     # Loopback pipeline (en→zh)
@@ -5973,10 +6234,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
     _NO_TRANSLATE = object()  # 哨兵值：不翻譯，只轉錄
 
-    def _drain_translations(pending, next_seq, lock, source):
-        """排乾翻譯結果佇列（有序輸出）"""
+    def _drain_translations(pending, next_seq, lock, source, label_override=None):
+        """排乾翻譯結果佇列（有序輸出）。label_override: 覆蓋 src_label（自動偵測語言時用）"""
         labels = bidi_cfg[source]  # (src_color, src_label, dst_color, dst_label)
         src_color, src_label, dst_color, dst_label = labels
+        if label_override:
+            src_label = label_override
         if source == "loopback":
             prefix_src = "◀ "
             prefix_dst = "◀ "
@@ -6033,6 +6296,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             t0 = time.monotonic()
             result = translator.translate(src_text)
             elapsed = time.monotonic() - t0
+            # 翻譯結果可能殘留簡體字（LLM 輸出不穩定），統一轉繁體
+            if result:
+                result = S2TWP.convert(result)
             with lock:
                 pending[seq] = (src_text, result, elapsed, asr_elapsed)
             _drain_translations(pending, next_seq, lock, source)
@@ -6071,17 +6337,26 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         with _active_lock:
             _active_transcriptions[0] += 1
         try:
-            # 最多等 step_sec 秒取得序列化鎖；逾時則丟棄此 chunk（下次會取到更新的音訊）
+            if not wav_path or not os.path.isfile(wav_path):
+                with res_lock:
+                    pending_res[seq] = _TRANSCRIBE_FAILED
+                return
+            # 序列化鎖：Metal GPU 不允許並行 command buffer（會 crash）
+            # 超時 = step_sec：等太久不如放棄，下一個 chunk 有更新的音訊
             if not _serial_lock.acquire(timeout=step_sec):
                 with res_lock:
                     pending_res[seq] = _TRANSCRIBE_FAILED
                 return
             try:
-                segments, full_text, proc_time = local_transcribe(wav_path, lang)
+                if stop_event.is_set() or not os.path.isfile(wav_path):
+                    with res_lock:
+                        pending_res[seq] = _TRANSCRIBE_FAILED
+                    return
+                segments, full_text, proc_time, detected_lang = local_transcribe(wav_path, lang)
             finally:
                 _serial_lock.release()
             with res_lock:
-                pending_res[seq] = (segments, full_text, proc_time)
+                pending_res[seq] = (segments, full_text, proc_time, detected_lang)
             if not _slow_warned[0] and proc_time > (length_ms / 1000.0) * 1.5:
                 _slow_warned[0] = True
                 _rec = _recommended_whisper_model(mode)
@@ -6108,24 +6383,35 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     mic_recent = deque(maxlen=10)
 
     def is_duplicate(text, recent):
+        from difflib import SequenceMatcher
         text_lower = text.lower().strip()
         if not text_lower:
             return True
         for prev in recent:
             if text_lower == prev:
                 return True
-            # 子字串比對只在重疊度 > 70% 時才算重複（避免短句誤判）
+            # 子字串比對：重疊度 > 70% 時算重複
             shorter = min(len(text_lower), len(prev))
             longer = max(len(text_lower), len(prev))
             if shorter > 0 and (text_lower in prev or prev in text_lower):
                 if shorter / longer > 0.7:
                     return True
+            # 字元相似度比對：滑動視窗重疊導致文字略有不同但內容重複
+            # shorter >= 8 避免短句誤判（如「中文測試」vs「英文測試」ratio=0.75）
+            if shorter >= 8 and SequenceMatcher(None, text_lower, prev).ratio() > 0.6:
+                return True
         return False
 
     # ── 排乾辨識結果 ──
+    # 語言→幻覺檢查對照（語言預偵測模式用）
+    _hallu_by_lang = {"en": _is_en_hallucination, "zh": _is_zh_hallucination,
+                      "ja": _is_ja_hallucination}
+
     def drain_ordered_results(source, pending_res, next_disp, res_lock,
                               trans_seq, trans_pending, trans_next, trans_lock,
-                              translator, recent, lang, hallucination_check):
+                              translator, recent, lang, hallucination_check,
+                              skip_english=False):
+        """排乾辨識結果。skip_english: 偵測到英文時跳過翻譯直接顯示"""
         _NOT_READY = object()
         labels = bidi_cfg[source]
         src_color, src_label = labels[0], labels[1]
@@ -6141,9 +6427,13 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             next_disp[0] += 1
             if result is _TRANSCRIBE_FAILED:
                 continue
-            segments, full_text, proc_time = result
+            segments, full_text, proc_time, detected_lang = result
             if not full_text:
                 continue
+            # 語言預偵測模式：用 detected_lang 決定處理邏輯
+            _effective_lang = detected_lang if (lang is None) else lang
+            _skip_this = (skip_english and _effective_lang == "en")
+            _hallu_fn = _hallu_by_lang.get(_effective_lang, hallucination_check) if (lang is None) else hallucination_check
             lines = []
             if segments:
                 for seg in segments:
@@ -6155,20 +6445,21 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             for line in lines:
                 if not line:
                     continue
-                # 中文輸入做 S2TWP 轉換
-                if lang == "zh":
+                # 中文輸入做 S2TWP 轉換（語言預偵測時根據 detected_lang 判斷）
+                if _effective_lang == "zh":
                     line = S2TWP.convert(line)
-                if hallucination_check(line):
+                if _hallu_fn(line):
                     continue
                 if is_duplicate(line, recent):
                     continue
                 recent.append(line.lower().strip())
                 seq = trans_seq[0]; trans_seq[0] += 1
-                if translator is None:
+                if translator is None or _skip_this:
                     # 不翻譯：直接塞入翻譯佇列，用 _NO_TRANSLATE 哨兵
                     with trans_lock:
                         trans_pending[seq] = (line, _NO_TRANSLATE, 0, proc_time)
-                    _drain_translations(trans_pending, trans_next, trans_lock, source)
+                    _drain_translations(trans_pending, trans_next, trans_lock, source,
+                                        label_override="EN" if _skip_this else None)
                 else:
                     threading.Thread(
                         target=translate_and_print,
@@ -6186,7 +6477,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         stop_event.set()
         # 等待進行中的辨識完成，避免 MLX Metal mutex 崩潰
         _still_active = False
-        for _w in range(50):  # 最多等 5 秒（sample_len=80 最壞 ~4-5s）
+        for _w in range(20):  # 最多等 2 秒（os._exit 會強制結束，不需等太久）
             with _active_lock:
                 if _active_transcriptions[0] <= 0:
                     break
@@ -6194,7 +6485,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         else:
             _still_active = True
         # 等待進行中的翻譯完成，避免翻譯輸出混入錄音儲存訊息
-        for _w in range(80):  # 最多等 8 秒（翻譯可能需要較長時間）
+        for _w in range(20):  # 最多等 2 秒
             with _active_trans_lock:
                 if _active_translations[0] <= 0:
                     break
@@ -6215,16 +6506,19 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
         return _still_active
 
+    _sigint_count = [0]
+
     def signal_handler(signum, frame):
+        _sigint_count[0] += 1
+        if _sigint_count[0] >= 2:
+            # 第二次 Ctrl+C：強制結束，跳過所有清理
+            _force_exit(1)
         clear_status_bar()
         restore_terminal()
-        _force_exit = _cleanup_bidi()
+        _cleanup_bidi()
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
-        if _force_exit:
-            # MLX Metal GPU 仍在執行中，sys.exit() 會觸發 segfault
-            # 用 os._exit() 跳過 Python 析構，直接結束程序
-            os._exit(0)
-        sys.exit(0)
+        # 一律用 os._exit() 避免 atexit/thread 清理造成卡住
+        _force_exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -6323,12 +6617,13 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                         active = _active_transcriptions[0]
                     if active < _MAX_CONCURRENT_TRANSCRIPTIONS:
                         wav_path, rms = extract_wav_mic()
-                        # mic_translate=True（en_zh 雙向）：門檻 0.02 過濾喇叭漏音
+                        # mic_translate=True（en_zh 雙向）：門檻 0.003 過濾喇叭漏音
                         # mic_translate=False（--mic）：門檻 0.002（峰值 RMS，適合藍牙麥克風）
-                        _mic_rms_threshold = 0.02 if mic_translate else 0.002
-                        # Echo gate：loopback 有聲音時提高 mic 門檻，防止喇叭漏音觸發 ASR
+                        _mic_rms_threshold = 0.003 if mic_translate else 0.002
+                        # Echo gate：loopback 有聲音時適度提高 mic 門檻，防止喇叭漏音觸發 ASR
+                        # AirPods 正常說話峰值 RMS ~0.01-0.03，門檻不能高於 0.015
                         if _last_lb_rms > 0.01:
-                            _mic_rms_threshold = max(_mic_rms_threshold, 0.08)
+                            _mic_rms_threshold = max(_mic_rms_threshold, 0.015)
                         if rms >= _mic_rms_threshold:
                             seq = mic_transcribe_seq[0]; mic_transcribe_seq[0] += 1
                             threading.Thread(
@@ -6343,7 +6638,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
             drain_ordered_results("mic", mic_pending_results, mic_next_display_seq, mic_results_lock,
                                   _trans_seq_mic, _trans_pending_mic, _trans_next_mic, _trans_lock_mic,
-                                  translator_mic, mic_recent, mic_lang, mic_hallu)
+                                  translator_mic, mic_recent, mic_lang, mic_hallu,
+                                  skip_english=_mic_skip_english)
 
     except KeyboardInterrupt:
         signal_handler(signal.SIGINT, None)
@@ -6352,7 +6648,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     restore_terminal()
     _force = _cleanup_bidi()
     if _force:
-        os._exit(0)
+        _force_exit(0)
 
 
 def render_markdown(text):
@@ -6402,7 +6698,7 @@ def _wait_for_esc():
             while True:
                 if msvcrt.kbhit():
                     ch = msvcrt.getch()
-                    # 方向鍵/功能鍵前綴：吃掉第二個 scan code
+                    # 方向鍵/功能鍵開頭：吃掉第二個 scan code
                     if ch in (b'\x00', b'\xe0'):
                         if msvcrt.kbhit():
                             msvcrt.getch()
@@ -7073,8 +7369,8 @@ def run_record_only(rec_device, topic=None):
     _TS_W = 7  # "H:MM:SS" = 7 字元，"MM:SS" 右對齊補空格
     _num_lines = rec_ch  # 每個聲道一行
 
-    # 多聲道前綴: "  " + ts(7) + "  " + "3 "(2) = 13
-    # 單聲道前綴: "  " + ts(7) + "  " = 11
+    # 多聲道開頭: "  " + ts(7) + "  " + "3 "(2) = 13
+    # 單聲道開頭: "  " + ts(7) + "  " = 11
     if rec_ch > 1:
         _CH_LABEL_W = len(str(rec_ch)) + 1  # "3 " = 2 chars for 3ch
         _BAR_W = max(60 - (_TS_W + 4 + _CH_LABEL_W), 10)
@@ -8124,13 +8420,9 @@ def _is_zh_hallucination(text):
     # 重複模式偵測 2：任何字元連續出現 6 次以上
     if re.search(r'(.)\1{5,}', _t):
         return True
-    # 重複模式偵測 3：短片段重複 4 次以上（如「都不都不都不都不...」）
-    if len(_t) >= 8:
-        for plen in range(1, 5):
-            unit = _t[:plen]
-            if unit and _t == unit * (len(_t) // plen) + unit[:len(_t) % plen]:
-                if len(_t) // plen >= 4:
-                    return True
+    # 重複模式偵測 3：任意位置 2-4 字元片段連續重複 4 次以上（如「有多少多少多少多少...」）
+    if len(_t) >= 8 and re.search(r'(.{2,4})\1{3,}', _t):
+        return True
     # 太短的中文（去除標點後不到 2 個字）
     _stripped = re.sub(r'[^\u4e00-\u9fff\u3040-\u30ff]', '', _t)
     if len(_stripped) < 2:
@@ -8406,7 +8698,7 @@ def _diarize_segments(wav_path, segments, num_speakers=None, sbar=None):
             continue
 
         try:
-            # 滑動窗口 embedding：長段落取多個 partial 後用中位數，更穩定
+            # 滑動視窗 embedding：長段落取多個 partial 後用中位數，更穩定
             if duration >= 1.6:
                 emb, partials, _ = encoder.embed_utterance(
                     audio_slice, return_partials=True, rate=1.6, min_coverage=0.75
@@ -8681,7 +8973,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             return None, None, None
 
         print(f"  {C_WHITE}載入模型    {model_size}...{RESET}", end=" ", flush=True)
-        model = WhisperModel(model_size, device="auto", compute_type="int8")
+        model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8")
         print(f"{C_OK}✓{RESET}")
         print(f"  {C_WHITE}辨識中...{RESET}\n")
 
@@ -9011,11 +9303,11 @@ def process_bidi_audio_files(lb_path, mic_path, mode, translator_lb, translator_
 
     # Log 檔名
     log_prefixes = {"en_zh": "英中雙向_時間逐字稿", "ja_zh": "日中雙向_時間逐字稿",
-                    "en2zh": "英翻中_雙向時間逐字稿",
-                    "zh2en": "中翻英_雙向時間逐字稿", "ja2zh": "日翻中_雙向時間逐字稿",
-                    "zh2ja": "中翻日_雙向時間逐字稿", "en": "英文_雙向時間逐字稿",
-                    "zh": "中文_雙向時間逐字稿", "ja": "日文_雙向時間逐字稿"}
-    log_prefix = log_prefixes.get(mode, "雙向_時間逐字稿")
+                    "en2zh": "英翻中_配對時間逐字稿",
+                    "zh2en": "中翻英_配對時間逐字稿", "ja2zh": "日翻中_配對時間逐字稿",
+                    "zh2ja": "中翻日_配對時間逐字稿", "en": "英文_配對時間逐字稿",
+                    "zh": "中文_配對時間逐字稿", "ja": "日文_配對時間逐字稿"}
+    log_prefix = log_prefixes.get(mode, "配對_時間逐字稿")
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = os.path.join(LOG_DIR, f"{lb_basename}_{ts_str}")
     os.makedirs(session_dir, exist_ok=True)
@@ -9083,7 +9375,7 @@ def process_bidi_audio_files(lb_path, mic_path, mode, translator_lb, translator_
                 return []
 
             print(f"  {C_WHITE}{label} 載入模型 {model_size}...{RESET}", end=" ", flush=True)
-            model = WhisperModel(model_size, device="auto", compute_type="int8")
+            model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8")
             print(f"{C_OK}✓{RESET}")
 
             sbar = _SummaryStatusBar(model=model_size, task=f"{label} 辨識中", asr_location="本機").start()
@@ -9573,6 +9865,24 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
         out_name = basename.replace("中文_雙向時間逐字稿", "中文_雙向摘要", 1)
     elif basename.startswith("日文_雙向時間逐字稿"):
         out_name = basename.replace("日文_雙向時間逐字稿", "日文_雙向摘要", 1)
+    elif basename.startswith("日中雙向_時間逐字稿"):
+        out_name = basename.replace("日中雙向_時間逐字稿", "日中雙向_摘要", 1)
+    elif basename.startswith("英翻中_配對時間逐字稿"):
+        out_name = basename.replace("英翻中_配對時間逐字稿", "英翻中_配對摘要", 1)
+    elif basename.startswith("中翻英_配對時間逐字稿"):
+        out_name = basename.replace("中翻英_配對時間逐字稿", "中翻英_配對摘要", 1)
+    elif basename.startswith("日翻中_配對時間逐字稿"):
+        out_name = basename.replace("日翻中_配對時間逐字稿", "日翻中_配對摘要", 1)
+    elif basename.startswith("中翻日_配對時間逐字稿"):
+        out_name = basename.replace("中翻日_配對時間逐字稿", "中翻日_配對摘要", 1)
+    elif basename.startswith("英文_配對時間逐字稿"):
+        out_name = basename.replace("英文_配對時間逐字稿", "英文_配對摘要", 1)
+    elif basename.startswith("中文_配對時間逐字稿"):
+        out_name = basename.replace("中文_配對時間逐字稿", "中文_配對摘要", 1)
+    elif basename.startswith("日文_配對時間逐字稿"):
+        out_name = basename.replace("日文_配對時間逐字稿", "日文_配對摘要", 1)
+    elif basename.startswith("配對_時間逐字稿"):
+        out_name = basename.replace("配對_時間逐字稿", "配對_摘要", 1)
     elif basename.startswith("英翻中_時間逐字稿"):
         out_name = basename.replace("英翻中_時間逐字稿", "英翻中_摘要", 1)
     elif basename.startswith("中翻英_時間逐字稿"):
@@ -10519,7 +10829,7 @@ def keypress_listener_thread(stop_event, ctrl_s_event=None, pause_event=None):
             try:
                 if msvcrt.kbhit():
                     ch = msvcrt.getch()
-                    # 方向鍵/功能鍵前綴：吃掉第二個 scan code，避免誤判為 Ctrl 按鍵
+                    # 方向鍵/功能鍵開頭：吃掉第二個 scan code，避免誤判為 Ctrl 按鍵
                     if ch in (b'\x00', b'\xe0'):
                         if msvcrt.kbhit():
                             msvcrt.getch()
@@ -11469,6 +11779,32 @@ def main():
 
         # 雙向配對偵測
         _bidi_pair = _detect_bidi_file_pair(args.input)
+        # 單檔自動偵測配對：檔名含「系統音訊」或「麥克風」時，找同 timestamp 配對
+        if not _bidi_pair and len(args.input) == 1 and mode in _LB_LANG:
+            import re as _re_pair
+            _fname = os.path.basename(args.input[0])
+            _fdir = os.path.dirname(args.input[0]) or RECORDING_DIR
+            _m_lb = _re_pair.match(r"(錄音.*_)系統音訊(_\d{8}_\d{6}\..*)", _fname)
+            _m_mic = _re_pair.match(r"(錄音.*_)麥克風(_\d{8}_\d{6}\..*)", _fname)
+            if _m_lb or _m_mic:
+                if _m_lb:
+                    _other_fname = _m_lb.group(1) + "麥克風" + _m_lb.group(2)
+                else:
+                    _other_fname = _m_mic.group(1) + "系統音訊" + _m_mic.group(2)
+                _other_path = os.path.join(_fdir, _other_fname)
+                if os.path.isfile(_other_path):
+                    print(f"\n  {C_OK}偵測到配對檔案: {_other_fname}{RESET}")
+                    print(f"  {C_WHITE}要一起處理嗎？(Y/n)：{RESET}", end=" ")
+                    try:
+                        _ans = input().strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        _ans = "n"
+                    if _ans != "n":
+                        if _m_lb:
+                            args.input = [args.input[0], _other_path]
+                        else:
+                            args.input = [_other_path, args.input[0]]
+                        _bidi_pair = _detect_bidi_file_pair(args.input)
         if _bidi_pair and mode in _LB_LANG:
             lb_path, mic_path = _bidi_pair
             # 建立兩路翻譯器
@@ -11551,7 +11887,7 @@ def main():
                     "translate_model": ollama_model if need_translate and ollama_available else None,
                     "translate_server": f"{srv_label} @ {host}:{port}" if need_translate and ollama_available else None,
                     "input_format": os.path.splitext(orig_fpath)[1].lstrip(".").lower(),
-                    "input_file": os.path.basename(orig_fpath),
+                    "input_file": f"{os.path.basename(_bidi_pair[0])} + {os.path.basename(_bidi_pair[1])}" if _bidi_pair else os.path.basename(orig_fpath),
                     "summary_model": summary_model,
                     "summary_server": f"{srv_label} @ {host}:{port}",
                     "meeting_topic": meeting_topic,
