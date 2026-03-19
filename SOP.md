@@ -409,6 +409,20 @@ cd C:\jt-live-whisper
 - 淺色/深色主題切換
 - 手機/平板 responsive
 
+**設定頁面**
+
+![WebUI 設定頁 - 輸入來源與語音辨識](images/webui-settings-1.png)
+
+![WebUI 設定頁 - 翻譯引擎與音訊裝置](images/webui-settings-2.png)
+
+**對話模式** - 聊天風格，對方靠左、自己靠右
+
+![WebUI 對話模式 - 英中雙向](images/webui-chat-bidi.png)
+
+**字幕模式** - 電影風格，黑底大字
+
+![WebUI 字幕模式 - 雙向](images/webui-subtitle-bidi.png)
+
 WebUI 需要 fastapi、uvicorn、websockets 套件（安裝腳本已自動安裝）。
 
 ### 4-8. 命令列參數（跳過選單直接啟動）

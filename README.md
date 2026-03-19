@@ -11,6 +11,8 @@ Author: Jason Cheng (Jason Tools)
 
 ![即時英翻中字幕運作中](images/realtime-en2zh-1.png)
 
+![WebUI 瀏覽器介面 - 英中雙向對話模式](images/webui-chat-bidi.png)
+
 &nbsp;
 
 &nbsp;
@@ -149,6 +151,7 @@ Author: Jason Cheng (Jason Tools)
 - **會議主題感知翻譯**：可指定會議主題（如「ZFS 儲存管理」），讓 LLM 根據領域上下文精準翻譯專業術語
 - **自動偵測 LLM 伺服器**：支援 Ollama、LM Studio、Jan.ai、vLLM、LocalAI、llama.cpp、LiteLLM 等本地端 LLM 伺服器
 - **互動式選單 + CLI 模式**：新手友善的選單介面，進階用戶可用命令列參數直接啟動
+- **WebUI 瀏覽器介面**：`./start.sh --webui` 在瀏覽器中操作所有功能，支援即時字幕、離線處理、講者辨識、摘要，手機/平板也可使用
 
 &nbsp;
 
@@ -355,6 +358,36 @@ cd C:\jt-live-whisper
 ## 使用方式
 
 > 以下範例以 macOS 指令為主。Windows 使用者請將 `./start.sh` 替換為 `.\start.ps1`，安裝目錄為 `C:\jt-live-whisper`。其餘參數完全相同。
+
+### WebUI 瀏覽器介面（推薦）
+
+```bash
+./start.sh --webui            # macOS
+.\start.ps1 --webui           # Windows
+```
+
+自動開啟瀏覽器（預設 http://localhost:19781），在網頁中完成所有設定後按「開始」即可。
+
+- 所有即時/離線功能皆可在瀏覽器操作，不需記指令
+- 離線處理：講者辨識、摘要、摘要模型選擇
+- 辨識模型依裝置自動推薦、翻譯引擎依設定自動選擇
+- 各階段即時進度顯示（辨識/講者辨識/LLM 校正/摘要 含 tokens 數）
+- 聊天模式與字幕模式切換、淺色/深色主題
+- 手機/平板也可使用
+
+**設定頁面**
+
+![WebUI 設定頁 - 輸入來源與語音辨識](images/webui-settings-1.png)
+
+![WebUI 設定頁 - 翻譯引擎與音訊裝置](images/webui-settings-2.png)
+
+**對話模式**（聊天風格，對方靠左、自己靠右）
+
+![WebUI 對話模式](images/webui-chat.png)
+
+**字幕模式**（電影風格，黑底大字，支援雙向顯示）
+
+![WebUI 字幕模式 - 雙向](images/webui-subtitle-bidi.png)
 
 ### 即時模式（預設，邊聽邊轉）
 
